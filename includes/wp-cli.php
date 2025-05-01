@@ -2,9 +2,9 @@
 
 // TODO: reduce some of the duplication between the CLI commands and the main class
 
-WP_CLI::add_command( 'msm-sitemap', 'Metro_Sitemap_CLI' );
+WP_CLI::add_command( 'prc sitemap', 'PRC_Sitemap_CLI' );
 
-class Metro_Sitemap_CLI extends WP_CLI_Command {
+class PRC_Sitemap_CLI extends WP_CLI_Command {
 	/**
 	 * @var string Type of command triggered so we can keep track of killswitch cleanup.
 	 */
@@ -23,12 +23,12 @@ class Metro_Sitemap_CLI extends WP_CLI_Command {
 	function generate_sitemap( $args, $assoc_args ) {
 		$this->command = 'all';
 
-		$all_years_with_posts = Metro_Sitemap::check_year_has_posts();
+		$all_years_with_posts = PRC_Sitemap::check_year_has_posts();
 
 		$sitemap_args = array();
 		foreach ( $all_years_with_posts as $year ) {
 			if ( $this->halt_execution() ) {
-				delete_option( 'msm_stop_processing' );
+				delete_option( 'prc_stop_processing' );
 				break;
 			}
 
@@ -43,20 +43,27 @@ class Metro_Sitemap_CLI extends WP_CLI_Command {
 	 * @subcommand generate-sitemap-for-year
 	 */
 	function generate_sitemap_for_year( $args, $assoc_args ) {
-		if ( empty( $this->command ) )
+		if ( empty( $this->command ) ) {
 			$this->command = 'year';
+		}
 
-		$assoc_args = wp_parse_args( $assoc_args, array(
-			'year' => false,
-		) );
+		$assoc_args = wp_parse_args(
+			$assoc_args,
+			array(
+				'year' => false,
+			)
+		);
 
 		$year = intval( $assoc_args['year'] );
 
 		$valid = $this->validate_year( $year );
-		if ( is_wp_error( $valid ) )
+		if ( is_wp_error( $valid ) ) {
 			WP_CLI::error( $valid->get_error_message() );
+		}
 
-		WP_CLI::log( sprintf( 'Generating sitemap for %s', $year ) );
+		$enabled_post_types = PRC_Sitemap::get_supported_post_types();
+
+		WP_CLI::line( sprintf( 'Generating sitemap for %s (%s)', $year, implode( ', ', $enabled_post_types ) ) );
 
 		$max_month = 12;
 		if ( date( 'Y' ) == $year ) {
@@ -67,8 +74,9 @@ class Metro_Sitemap_CLI extends WP_CLI_Command {
 
 		foreach ( $months as $month ) {
 			if ( $this->halt_execution() ) {
-				if ( 'year' === $this->command )
-					delete_option( 'msm_stop_processing' );
+				if ( 'year' === $this->command ) {
+					delete_option( 'prc_stop_processing' );
+				}
 
 				break;
 			}
@@ -82,22 +90,29 @@ class Metro_Sitemap_CLI extends WP_CLI_Command {
 	 * @subcommand generate-sitemap-for-year-month
 	 */
 	function generate_sitemap_for_year_month( $args, $assoc_args ) {
-		if ( empty( $this->command ) )
+		if ( empty( $this->command ) ) {
 			$this->command = 'month';
+		}
 
-		$assoc_args = wp_parse_args( $assoc_args, array(
-			'year' => false,
-			'month' => false,
-		) );
+		$assoc_args = wp_parse_args(
+			$assoc_args,
+			array(
+				'year'  => false,
+				'month' => false,
+			)
+		);
 
-		$year = intval( $assoc_args['year'] );
+		$year  = intval( $assoc_args['year'] );
 		$month = intval( $assoc_args['month'] );
 
 		$valid = $this->validate_year_month( $year, $month );
-		if ( is_wp_error( $valid ) )
+		if ( is_wp_error( $valid ) ) {
 			WP_CLI::error( $valid->get_error_message() );
+		}
 
-		WP_CLI::log( sprintf( 'Generating sitemap for %s-%s', $year, $month ) );
+		$enabled_post_types = PRC_Sitemap::get_supported_post_types();
+
+		WP_CLI::line( sprintf( 'Generating sitemap for %s-%s (%s)', $year, $month, implode( ', ', $enabled_post_types ) ) );
 
 		// Calculate actual number of days in the month since we don't have cal_days_in_month available
 		if ( ! function_exists( 'cal_days_in_month' ) ) {
@@ -114,8 +129,9 @@ class Metro_Sitemap_CLI extends WP_CLI_Command {
 
 		foreach ( $days as $day ) {
 			if ( $this->halt_execution() ) {
-				if ( 'month' === $this->command )
-					delete_option( 'msm_stop_processing' );
+				if ( 'month' === $this->command ) {
+					delete_option( 'prc_stop_processing' );
+				}
 
 				break;
 			}
@@ -130,59 +146,71 @@ class Metro_Sitemap_CLI extends WP_CLI_Command {
 	 * @subcommand generate-sitemap-for-year-month-day
 	 */
 	function generate_sitemap_for_year_month_day( $args, $assoc_args ) {
-		if ( empty( $this->command ) )
+		if ( empty( $this->command ) ) {
 			$this->command = 'day';
+		}
 
-		$assoc_args = wp_parse_args( $assoc_args, array(
-			'year' => false,
-			'month' => false,
-			'day' => false,
-		) );
+		$assoc_args = wp_parse_args(
+			$assoc_args,
+			array(
+				'year'  => false,
+				'month' => false,
+				'day'   => false,
+			)
+		);
 
-		$year = intval( $assoc_args['year'] );
+		$year  = intval( $assoc_args['year'] );
 		$month = intval( $assoc_args['month'] );
-		$day = intval( $assoc_args['day'] );
-		
+		$day   = intval( $assoc_args['day'] );
+
 		$valid = $this->validate_year_month_day( $year, $month, $day );
-		if ( is_wp_error( $valid ) )
+		if ( is_wp_error( $valid ) ) {
 			WP_CLI::error( $valid->get_error_message() );
+		}
 
-		WP_CLI::log( sprintf( 'Generating sitemap for %s-%s-%s', $year, $month, $day ) );
+		$enabled_post_types = PRC_Sitemap::get_supported_post_types();
 
-		$date_stamp = Metro_Sitemap::get_date_stamp( $year, $month, $day );
-		if ( Metro_Sitemap::date_range_has_posts( $date_stamp, $date_stamp ) ) {
-			Metro_Sitemap::generate_sitemap_for_date( $date_stamp ); // TODO: simplify; this function should accept the year, month, day and translate accordingly
+		WP_CLI::line( sprintf( 'Generating sitemap for %s-%s-%s (%s)', $year, $month, $day, implode( ', ', $enabled_post_types ) ) );
+
+		$date_stamp = PRC_Sitemap::get_date_stamp( $year, $month, $day );
+		if ( PRC_Sitemap::date_range_has_posts( $date_stamp, $date_stamp ) ) {
+			PRC_Sitemap::generate_sitemap_for_date( $date_stamp ); // TODO: simplify; this function should accept the year, month, day and translate accordingly
 		} else {
-			Metro_Sitemap::delete_sitemap_for_date( $date_stamp );
+			PRC_Sitemap::delete_sitemap_for_date( $date_stamp );
 		}
 	}
 
 	private function validate_year( $year ) {
-		if ( $year > date( 'Y' ) )
-			return new WP_Error( 'msm-invalid-year', __( 'Please specify a valid year', 'metro-sitemap' ) );
+		if ( $year > date( 'Y' ) ) {
+			return new WP_Error( 'prc-invalid-year', __( 'Please specify a valid year', 'prc-sitemap' ) );
+		}
 
 		return true;
 	}
 
 	private function validate_year_month( $year, $month ) {
 		$valid_year = $this->validate_year( $year );
-		if ( is_wp_error( $valid_year ) )
+		if ( is_wp_error( $valid_year ) ) {
 			return $valid_year;
+		}
 
-		if ( $month < 1 || $month > 12 )
-			return new WP_Error( 'msm-invalid-month', __( 'Please specify a valid month', 'metro-sitemap' ) );
+		if ( $month < 1 || $month > 12 ) {
+			return new WP_Error( 'prc-invalid-month', __( 'Please specify a valid month', 'prc-sitemap' ) );
+		}
 
 		return true;
 	}
 
 	private function validate_year_month_day( $year, $month, $day ) {
 		$valid_year_month = $this->validate_year_month( $year, $month );
-		if ( is_wp_error( $valid_year_month ) )
+		if ( is_wp_error( $valid_year_month ) ) {
 			return $valid_year_month;
+		}
 
 		$date = strtotime( sprintf( '%d-%d-%d', $year, $month, $day ) );
-		if ( false === $date )
-			return new WP_Error( 'msm-invalid-day', __( 'Please specify a valid day', 'metro-sitemap' ) );
+		if ( false === $date ) {
+			return new WP_Error( 'prc-invalid-day', __( 'Please specify a valid day', 'prc-sitemap' ) );
+		}
 
 		return true;
 	}
@@ -195,33 +223,32 @@ class Metro_Sitemap_CLI extends WP_CLI_Command {
 
 		$all_sitemaps = get_posts(
 			array(
-				'post_type' => Metro_Sitemap::SITEMAP_CPT,
-				'post_status' => 'publish',
-				'fields' => 'ids',
+				'post_type'        => PRC_Sitemap::SITEMAP_CPT,
+				'post_status'      => 'publish',
+				'fields'           => 'ids',
 				'suppress_filters' => false,
-				'posts_per_page' => -1,
+				'posts_per_page'   => -1,
 			)
 		);
 
-		$total_count = 0;
+		$total_count   = 0;
 		$sitemap_count = 0;
 
 		foreach ( $all_sitemaps as $sitemap_id ) {
 
-			$xml_data = get_post_meta( $sitemap_id, 'msm_sitemap_xml', true );
+			$xml_data = get_post_meta( $sitemap_id, 'prc_sitemap_xml', true );
 
-			$xml = simplexml_load_string( $xml_data );
+			$xml   = simplexml_load_string( $xml_data );
 			$count = count( $xml->url );
-			update_post_meta( $sitemap_id, 'msm_indexed_url_count', $count );
+			update_post_meta( $sitemap_id, 'prc_indexed_url_count', $count );
 
-			$total_count += $count;
+			$total_count   += $count;
 			$sitemap_count += 1;
 		}
 
-		update_option( 'msm_sitemap_indexed_url_count', $total_count, false );
-		WP_CLI::log( sprintf( 'Total posts found: %s', $total_count ) );
-		WP_CLI::log( sprintf( 'Number of sitemaps found: %s', $sitemap_count ) );
-
+		update_option( 'prc_sitemap_indexed_url_count', $total_count, false );
+		WP_CLI::line( sprintf( 'Total posts found: %s', $total_count ) );
+		WP_CLI::line( sprintf( 'Number of sitemaps found: %s', $sitemap_count ) );
 	}
 
 	/**
@@ -233,9 +260,9 @@ class Metro_Sitemap_CLI extends WP_CLI_Command {
 	 * @return bool
 	 */
 	private function halt_execution() {
-		if ( $this->halt || get_option( 'msm_stop_processing' ) ) {
+		if ( $this->halt || get_option( 'prc_stop_processing' ) ) {
 			// Allow user to bail out of the current process, doesn't remove where the job got up to
-			delete_option( 'msm_sitemap_create_in_progress' );
+			delete_option( 'prc_sitemap_create_in_progress' );
 			$this->halt = true;
 			return true;
 		}
