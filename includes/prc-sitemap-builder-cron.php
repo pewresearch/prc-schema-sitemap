@@ -30,7 +30,7 @@ class PRC_Sitemap_Builder_Cron {
 	 */
 	public static function add_actions( $actions ) {
 		// No actions for private blogs
-		if ( ! Metro_Sitemap::is_blog_public() ) {
+		if ( ! PRC_Sitemap::is_blog_public() ) {
 			return $actions;
 		}
 
@@ -90,9 +90,9 @@ class PRC_Sitemap_Builder_Cron {
 		}
 
 		if ( empty( $sitemap_create_in_progress ) ) {
-			Metro_Sitemap::show_action_message( __( 'Starting sitemap generation...', 'prc--sitemaps' ) );
+			PRC_Sitemap::show_action_message( __( 'Starting sitemap generation...', 'prc--sitemaps' ) );
 		} else {
-			Metro_Sitemap::show_action_message( __( 'Resuming sitemap creation', 'prc--sitemaps' ) );
+			PRC_Sitemap::show_action_message( __( 'Resuming sitemap creation', 'prc--sitemaps' ) );
 		}
 	}
 
@@ -102,12 +102,12 @@ class PRC_Sitemap_Builder_Cron {
 	 * Hooked into the prc_sitemap_actions-generate_from_latest action
 	 */
 	public static function action_generate_from_latest() {
-		$last_modified = Metro_Sitemap::get_last_modified_posts();
+		$last_modified = PRC_Sitemap::get_last_modified_posts();
 		if ( count( $last_modified ) > 0 ) {
-			Metro_Sitemap::update_sitemap_from_modified_posts();
-			Metro_Sitemap::show_action_message( __( 'Updating sitemap from latest articles...', 'prc--sitemaps' ) );
+			PRC_Sitemap::update_sitemap_from_modified_posts();
+			PRC_Sitemap::show_action_message( __( 'Updating sitemap from latest articles...', 'prc--sitemaps' ) );
 		} else {
-			Metro_Sitemap::show_action_message( __( 'Cannot generate from latest articles: no posts updated lately.', 'prc--sitemaps' ), 'error' );
+			PRC_Sitemap::show_action_message( __( 'Cannot generate from latest articles: no posts updated lately.', 'prc--sitemaps' ), 'error' );
 		}
 	}
 
@@ -119,12 +119,9 @@ class PRC_Sitemap_Builder_Cron {
 	public static function action_halt() {
 		// Can only halt generation if sitemap creation is already in process
 		if ( get_option( 'prc_stop_processing' ) === true ) {
-			Metro_Sitemap::show_action_message( __( 'Cannot stop sitemap generation: sitemap generation is already being halted.', 'prc--sitemaps' ), 'warning' );
-		} elseif ( get_option( 'prc_sitemap_create_in_progress' ) === true ) {
-			update_option( 'prc_stop_processing', true );
-			Metro_Sitemap::show_action_message( __( 'Stopping Sitemap generation', 'prc--sitemaps' ) );
+			PRC_Sitemap::show_action_message( __( 'Cannot stop sitemap generation: sitemap generation is already being halted.', 'prc--sitemaps' ), 'warning' );
 		} else {
-			Metro_Sitemap::show_action_message( __( 'Cannot stop sitemap generation: sitemap generation not in progress', 'prc--sitemaps' ), 'warning' );
+			PRC_Sitemap::show_action_message( __( 'Cannot stop sitemap generation: sitemap generation not in progress', 'prc--sitemaps' ), 'warning' );
 		}
 	}
 
@@ -136,10 +133,10 @@ class PRC_Sitemap_Builder_Cron {
 	public static function action_reset_data() {
 		// Do the same as when we finish then tell use to delete manuallyrather than remove all data
 		self::reset_sitemap_data();
-		Metro_Sitemap::show_action_message(
+		PRC_Sitemap::show_action_message(
 			sprintf(
 				__( '<p>Sitemap data reset. If you want to completely remove the data you must do so manually by deleting all posts with post type <code>%1$s</code>.</p><p>The WP-CLI command to do this is: <code>%2$s</code></p>', 'prc-sitemap' ),
-				Metro_Sitemap::SITEMAP_CPT,
+				PRC_Sitemap::SITEMAP_CPT,
 				'wp post delete $(wp post list --post_type=' . Metro_Sitemap::SITEMAP_CPT . ' --format=ids)'
 			)
 		);
@@ -204,7 +201,7 @@ class PRC_Sitemap_Builder_Cron {
 		$is_partial_or_running = get_option( 'prc_years_to_process' );
 
 		if ( empty( $is_partial_or_running ) ) {
-			$all_years_with_posts = Metro_Sitemap::check_year_has_posts();
+			$all_years_with_posts = PRC_Sitemap::check_year_has_posts();
 			update_option( 'prc_years_to_process', $all_years_with_posts );
 		} else {
 			$all_years_with_posts = $is_partial_or_running;
@@ -320,11 +317,11 @@ class PRC_Sitemap_Builder_Cron {
 		$month = $args['month'];
 		$day   = $args['day'];
 
-		$date_stamp = Metro_Sitemap::get_date_stamp( $year, $month, $day );
-		if ( Metro_Sitemap::date_range_has_posts( $date_stamp, $date_stamp ) ) {
-			Metro_Sitemap::generate_sitemap_for_date( $date_stamp );
+		$date_stamp = PRC_Sitemap::get_date_stamp( $year, $month, $day );
+		if ( PRC_Sitemap::date_range_has_posts( $date_stamp, $date_stamp ) ) {
+			PRC_Sitemap::generate_sitemap_for_date( $date_stamp );
 		} else {
-			Metro_Sitemap::delete_sitemap_for_date( $date_stamp );
+			PRC_Sitemap::delete_sitemap_for_date( $date_stamp );
 		}
 
 		self::find_next_day_to_process( $year, $month, $day );
@@ -341,7 +338,7 @@ class PRC_Sitemap_Builder_Cron {
 	public static function find_next_day_to_process( $year, $month, $day ) {
 
 		$halt = get_option( 'prc_stop_processing' ) === true;
-		if ( $halt || ! Metro_Sitemap::is_blog_public() ) {
+		if ( $halt || ! PRC_Sitemap::is_blog_public() ) {
 			// Allow user to bail out of the current process, doesn't remove where the job got up to
 			// or If the blog became private while sitemaps were enabled, stop here.
 			delete_option( 'prc_stop_processing' );

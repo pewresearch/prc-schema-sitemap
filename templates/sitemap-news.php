@@ -72,7 +72,7 @@ foreach ( $sitemap_dates as $current_date ) {
 			echo "\t\t<news:news>\n";
 			echo "\t\t\t<news:publication>\n";
 			echo "\t\t\t\t<news:name>" . esc_xml( get_bloginfo( 'name' ) ) . "</news:name>\n";
-			echo "\t\t\t\t<news:language>" . esc_xml( strtolower( get_locale() ) ) . "</news:language>\n";
+			echo "\t\t\t\t<news:language>en</news:language>\n";
 			echo "\t\t\t</news:publication>\n";
 			echo "\t\t\t<news:publication_date>" . esc_xml( get_the_date( 'c', $current_post ) ) . "</news:publication_date>\n";
 			echo "\t\t\t<news:title>" . esc_xml( get_the_title( $current_post ) ) . "</news:title>\n";

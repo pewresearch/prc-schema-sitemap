@@ -122,6 +122,9 @@ class PRC_Sitemap {
 		// News Sitemap.
 		add_rewrite_rule( '^sitemap-news.xml$', 'index.php?sitemap=true&sitemap-type=news', 'top' );
 
+		// RLS Sitemap.
+		add_rewrite_rule( '^sitemap-rls.xml$', 'index.php?sitemap=true&sitemap-type=rls', 'top' );
+
 		// All public archive taxonomy terms index sitemap.
 		add_rewrite_rule( '^sitemap-taxonomies.xml$', 'index.php?sitemap=true&sitemap-type=taxonomies-index', 'top' );
 		// Public taxonomy terms sitemap.
@@ -354,6 +357,7 @@ class PRC_Sitemap {
 				$output .= 'Sitemap: ' . home_url( '/sitemap.xml' ) . PHP_EOL;
 				$output .= 'Sitemap: ' . home_url( '/sitemap-taxonomies.xml' ) . PHP_EOL;
 				$output .= 'Sitemap: ' . home_url( '/sitemap-news.xml' ) . PHP_EOL;
+				$output .= 'Sitemap: ' . home_url( '/sitemap-rls.xml' ) . PHP_EOL;
 				$output .= PHP_EOL;
 			}
 		}
@@ -372,6 +376,8 @@ class PRC_Sitemap {
 	/**
 	 * Disable canonical redirects for the sitemap files
 	 *
+	 * @hook redirect_canonical
+	 *
 	 * @see http://codex.wordpress.org/Function_Reference/redirect_canonical
 	 * @param string $redirect_url The redirect URL.
 	 * @param string $requested_url The requested URL.
@@ -381,7 +387,7 @@ class PRC_Sitemap {
 		if ( self::$index_by_year ) {
 			$pattern = '|sitemap-([0-9]{4})\.xml|';
 		} else {
-			$pattern = '|sitemap\.xml|';
+			$pattern = '|sitemap(-[a-zA-Z0-9_-]+)*\.xml|';
 		}
 
 		if ( preg_match( $pattern, $requested_url ) ) {
@@ -727,6 +733,11 @@ class PRC_Sitemap {
 	public static function load_sitemap_template( $template ) {
 		$sitemap_type = get_query_var( 'sitemap-type' );
 		if ( $sitemap_type ) {
+			// Prevent WordPress from treating this as a 404.
+			global $wp_query;
+			$wp_query->is_404 = false;
+			status_header( 200 );
+
 			$template = __DIR__ . "/templates/sitemap-{$sitemap_type}.php";
 			// Check if the template exists.
 			if ( ! file_exists( $template ) ) {
