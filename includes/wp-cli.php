@@ -247,8 +247,90 @@ class PRC_Sitemap_CLI extends WP_CLI_Command {
 		}
 
 		update_option( 'prc_sitemap_indexed_url_count', $total_count, false );
+		
+		// Clear related caches after recount
+		delete_transient( 'prc_sitemap_count' );
+		delete_transient( 'prc_sitemap_recent_url_counts' );
+		wp_cache_delete( 'sitemap_stats', PRC_Sitemap::CACHE_GROUP );
+		
 		WP_CLI::line( sprintf( 'Total posts found: %s', $total_count ) );
 		WP_CLI::line( sprintf( 'Number of sitemaps found: %s', $sitemap_count ) );
+	}
+
+	/**
+	 * Clear all sitemap caches
+	 *
+	 * @subcommand clear-cache
+	 */
+	public function clear_cache() {
+		$deleted = PRC_Sitemap_Cache::invalidate_all_caches();
+		WP_CLI::success( sprintf( 'Cleared %d cached items.', $deleted ) );
+	}
+
+	/**
+	 * Show cache statistics
+	 *
+	 * @subcommand cache-stats
+	 */
+	public function cache_stats() {
+		$stats = PRC_Sitemap_Cache::get_cache_stats();
+		
+		WP_CLI::line( sprintf( 'Transients: %d', $stats['transients'] ) );
+		WP_CLI::line( sprintf( 'Timeouts: %d', $stats['timeouts'] ) );
+		WP_CLI::line( sprintf( 'Total: %d', $stats['total'] ) );
+	}
+
+	/**
+	 * Preload commonly used caches
+	 *
+	 * @subcommand preload-cache
+	 */
+	public function preload_cache() {
+		WP_CLI::line( 'Preloading sitemap caches...' );
+		PRC_Sitemap_Cache::preload_caches();
+		WP_CLI::success( 'Cache preloading completed.' );
+	}
+
+	/**
+	 * Clean up expired transients
+	 *
+	 * @subcommand cleanup-cache
+	 */
+	public function cleanup_cache() {
+		$deleted = PRC_Sitemap_Cache::cleanup_expired_transients();
+		WP_CLI::success( sprintf( 'Cleaned up %d expired cache items.', $deleted ) );
+	}
+
+	/**
+	 * Warm up caches for a date range
+	 *
+	 * @subcommand warm-cache
+	 * @synopsis --start=<start-date> --end=<end-date>
+	 */
+	public function warm_cache( $args, $assoc_args ) {
+		$assoc_args = wp_parse_args(
+			$assoc_args,
+			array(
+				'start' => date( 'Y-m-d', strtotime( '-7 days' ) ),
+				'end'   => date( 'Y-m-d' ),
+			)
+		);
+
+		$start_date = $assoc_args['start'];
+		$end_date   = $assoc_args['end'];
+
+		// Validate dates
+		if ( ! strtotime( $start_date ) || ! strtotime( $end_date ) ) {
+			WP_CLI::error( 'Invalid date format. Use Y-m-d format.' );
+		}
+
+		if ( strtotime( $start_date ) > strtotime( $end_date ) ) {
+			WP_CLI::error( 'Start date must be before end date.' );
+		}
+
+		WP_CLI::line( sprintf( 'Warming up caches from %s to %s...', $start_date, $end_date ) );
+		PRC_Sitemap_Cache::warm_up_date_range( $start_date, $end_date );
+		WP_CLI::success( 'Cache warming completed.' );
 	}
 
 	/**

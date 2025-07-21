@@ -9,6 +9,9 @@
 * Requires Plugins: prc-platform-core
 */
 
+// Load cache utility class.
+require __DIR__ . '/includes/class-prc-sitemap-cache.php';
+
 if ( defined( 'WP_CLI' ) && true === WP_CLI ) {
 	require __DIR__ . '/includes/wp-cli.php';
 }
@@ -34,6 +37,13 @@ class PRC_Sitemap {
 	const SITEMAP_CPT = 'prc_sitemap';
 
 	/**
+	 * Cache group for sitemap-related caching.
+	 *
+	 * @var string
+	 */
+	const CACHE_GROUP = 'prc_sitemap';
+
+	/**
 	 * Whether the sitemap is indexed by year.
 	 *
 	 * @var bool
@@ -44,7 +54,8 @@ class PRC_Sitemap {
 	 * Register actions for our hook
 	 */
 	public static function setup() {
-		define( 'PRC_INTERVAL_PER_GENERATION_EVENT', 60 ); // how far apart should full cron generation events be spaced
+		// How far apart should full cron generation events be spaced.
+		define( 'PRC_INTERVAL_PER_GENERATION_EVENT', 60 );
 
 		add_filter( 'cron_schedules', array( __CLASS__, 'sitemap_15_min_cron_interval' ) );
 
@@ -59,7 +70,21 @@ class PRC_Sitemap {
 		add_filter( 'posts_pre_query', array( __CLASS__, 'disable_main_query_for_sitemap_xml' ), 10, 2 );
 		add_filter( 'template_include', array( __CLASS__, 'load_sitemap_template' ) );
 
-		add_filter( 'prc_sitemap_entry', array( __CLASS__, 'add_entry_featured_image' ), 1, 999 ); // Run late so we don't conflict with other plugins
+		// Run late so we don't conflict with other plugins.
+		add_filter( 'prc_sitemap_entry', array( __CLASS__, 'add_entry_featured_image' ), 1, 999 );
+
+		// Cache invalidation hooks.
+		add_action( 'save_post', array( __CLASS__, 'invalidate_caches_on_post_change' ), 10, 2 );
+		add_action( 'delete_post', array( __CLASS__, 'invalidate_caches_on_post_change' ) );
+		add_action( 'wp_trash_post', array( __CLASS__, 'invalidate_caches_on_post_change' ) );
+		add_action( 'untrash_post', array( __CLASS__, 'invalidate_caches_on_post_change' ) );
+		add_action( 'transition_post_status', array( __CLASS__, 'invalidate_caches_on_post_status_change' ), 10, 3 );
+
+		// Cache cleanup cron.
+		add_action( 'prc_sitemap_cache_cleanup', array( __CLASS__, 'scheduled_cache_cleanup' ) );
+		if ( ! wp_next_scheduled( 'prc_sitemap_cache_cleanup' ) ) {
+			wp_schedule_event( time(), 'daily', 'prc_sitemap_cache_cleanup' );
+		}
 
 		// By default, we use wp-cron to help generate the full sitemap.
 		// However, this will let us override it, if necessary.
@@ -166,11 +191,23 @@ class PRC_Sitemap {
 			$n = intval( $_REQUEST['num_days'] );
 		}
 
+		// Try to get cached stats first
+		$cache_key   = "sitemap_ajax_stats_{$n}";
+		$cached_data = wp_cache_get( $cache_key, self::CACHE_GROUP );
+
+		if ( false !== $cached_data ) {
+			wp_send_json( $cached_data );
+			return;
+		}
+
 		$data = array(
 			'total_indexed_urls'   => number_format( self::get_total_indexed_url_count() ),
 			'total_sitemaps'       => number_format( self::count_sitemaps() ),
 			'sitemap_indexed_urls' => self::get_recent_sitemap_url_counts( $n ),
 		);
+
+		// Cache for 15 minutes (short duration for admin UI feedback)
+		wp_cache_set( $cache_key, $data, self::CACHE_GROUP, PRC_Sitemap_Cache::CACHE_TIMES['short'] );
 
 		wp_send_json( $data );
 	}
@@ -199,13 +236,32 @@ class PRC_Sitemap {
 
 		if ( isset( $_POST['action'] ) ) {
 			check_admin_referer( 'prc-sitemap-action' );
-			foreach ( $actions as $slug => $action ) {
-				if ( $action['text'] !== $_POST['action'] ) {
-					continue;
-				}
 
-				do_action( 'prc_sitemap_action-' . $slug );
-				break;
+			// Handle cache actions
+			if ( isset( $_POST['cache_action'] ) ) {
+				switch ( $_POST['cache_action'] ) {
+					case 'clear':
+						$deleted = self::clear_all_caches();
+						self::show_action_message( sprintf( __( 'Cleared %d cached items.', 'prc-sitemaps' ), $deleted ) );
+						break;
+					case 'preload':
+						PRC_Sitemap_Cache::preload_caches();
+						self::show_action_message( __( 'Cache preloading completed.', 'prc-sitemaps' ) );
+						break;
+					case 'cleanup':
+						$deleted = PRC_Sitemap_Cache::cleanup_expired_transients();
+						self::show_action_message( sprintf( __( 'Cleaned up %d expired cache items.', 'prc-sitemaps' ), $deleted ) );
+						break;
+				}
+			} else {
+				foreach ( $actions as $slug => $action ) {
+					if ( $action['text'] !== $_POST['action'] ) {
+						continue;
+					}
+
+					do_action( 'prc_sitemap_action-' . $slug );
+					break;
+				}
 			}
 		}
 
@@ -243,6 +299,43 @@ class PRC_Sitemap {
 				<input type="submit" name="action" class="button-secondary" value="<?php echo esc_attr( $action['text'] ); ?>">
 			<?php endforeach; ?>
 		</form>
+
+		<div style="clear: both;"></div>
+
+		<h3><?php esc_html_e( 'Cache Management', 'prc-sitemaps' ); ?></h3>
+		<?php
+		$cache_stats = PRC_Sitemap_Cache::get_cache_stats();
+		?>
+		<p><?php printf( __( 'Current cache items: %1$d transients, %2$d timeouts (Total: %3$d)', 'prc-sitemaps' ), $cache_stats['transients'], $cache_stats['timeouts'], $cache_stats['total'] ); ?></p>
+
+		<form action="<?php echo menu_page_url( 'prc-sitemap', false ); ?>" method="post" style="margin-top: 10px;">
+			<?php wp_nonce_field( 'prc-sitemap-action' ); ?>
+			<input type="submit" name="action" class="button-secondary" value="<?php esc_attr_e( 'Clear All Caches', 'prc-sitemaps' ); ?>">
+			<input type="hidden" name="cache_action" value="clear">
+		</form>
+
+		<form action="<?php echo menu_page_url( 'prc-sitemap', false ); ?>" method="post" style="display: inline-block; margin-top: 5px;">
+			<?php wp_nonce_field( 'prc-sitemap-action' ); ?>
+			<input type="submit" name="action" class="button-secondary" value="<?php esc_attr_e( 'Preload Caches', 'prc-sitemaps' ); ?>">
+			<input type="hidden" name="cache_action" value="preload">
+		</form>
+
+		<form action="<?php echo menu_page_url( 'prc-sitemap', false ); ?>" method="post" style="display: inline-block; margin-top: 5px; margin-left: 10px;">
+			<?php wp_nonce_field( 'prc-sitemap-action' ); ?>
+			<input type="submit" name="action" class="button-secondary" value="<?php esc_attr_e( 'Cleanup Expired', 'prc-sitemaps' ); ?>">
+			<input type="hidden" name="cache_action" value="cleanup">
+		</form>
+
+		<div style="margin-top: 15px;">
+			<p><strong><?php esc_html_e( 'Simplified Cache Strategy:', 'prc-sitemaps' ); ?></strong></p>
+			<ul style="margin-left: 20px;">
+				<li><?php esc_html_e( 'Admin UI responses: 15 minutes', 'prc-sitemaps' ); ?></li>
+				<li><?php esc_html_e( 'All sitemap data: 12 hours (perfect for low-frequency publishing)', 'prc-sitemaps' ); ?></li>
+				<li><?php esc_html_e( 'Static data (year ranges, taxonomies): 24 hours', 'prc-sitemaps' ); ?></li>
+				<li><?php esc_html_e( 'Caches auto-invalidate immediately when posts are published', 'prc-sitemaps' ); ?></li>
+			</ul>
+		</div>
+
 		</div>
 		<div id="tooltip"><strong class="content"></strong> <?php esc_html_e( 'indexed urls', 'prc-sitemaps' ); ?></div>
 		<?php
@@ -271,8 +364,20 @@ class PRC_Sitemap {
 	 * @return int The number of sitemaps that have been generated
 	 */
 	public static function count_sitemaps() {
-		$count = wp_count_posts( self::SITEMAP_CPT );
-		return (int) $count->publish;
+		$cache_key    = 'prc_sitemap_count';
+		$cached_count = get_transient( $cache_key );
+
+		if ( false !== $cached_count ) {
+			return (int) $cached_count;
+		}
+
+		$count  = wp_count_posts( self::SITEMAP_CPT );
+		$result = (int) $count->publish;
+
+		// Cache for 12 hours (standard duration for sitemap data)
+		set_transient( $cache_key, $result, PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
+
+		return $result;
 	}
 
 	/**
@@ -291,6 +396,13 @@ class PRC_Sitemap {
 	 * @return array An array of sitemap stats
 	 */
 	public static function get_recent_sitemap_url_counts( $n = 7 ) {
+		$cache_key    = "prc_sitemap_recent_url_counts_{$n}";
+		$cached_stats = get_transient( $cache_key );
+
+		if ( false !== $cached_stats ) {
+			return $cached_stats;
+		}
+
 		$stats = array();
 
 		for ( $i = 0; $i < $n; $i++ ) {
@@ -300,6 +412,9 @@ class PRC_Sitemap {
 
 			$stats[ $date ] = self::get_indexed_url_count( $year, $month, $day );
 		}
+
+		// Cache for 12 hours (standard duration for sitemap data)
+		set_transient( $cache_key, $stats, PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
 
 		return $stats;
 	}
@@ -402,16 +517,27 @@ class PRC_Sitemap {
 	 * @return int[] Valid years.
 	 */
 	public static function get_post_year_range() {
+		$cache_key    = 'prc_sitemap_post_year_range';
+		$cached_range = get_transient( $cache_key );
+
+		if ( false !== $cached_range ) {
+			return $cached_range;
+		}
+
 		global $wpdb;
 
 		$oldest_post_date_year = $wpdb->get_var( "SELECT DISTINCT YEAR(post_date) as year FROM $wpdb->posts WHERE post_status = 'publish' ORDER BY year ASC LIMIT 1" );
 
+		$result = array();
 		if ( null !== $oldest_post_date_year ) {
 			$current_year = date( 'Y' );
-			return range( (int) $oldest_post_date_year, $current_year );
+			$result       = range( (int) $oldest_post_date_year, $current_year );
 		}
 
-		return array();
+		// Cache for 24 hours (long duration for static data that rarely changes)
+		set_transient( $cache_key, $result, PRC_Sitemap_Cache::CACHE_TIMES['long'] );
+
+		return $result;
 	}
 
 	/**
@@ -420,16 +546,51 @@ class PRC_Sitemap {
 	 * @return int[] Years with posts.
 	 */
 	public static function check_year_has_posts() {
+		$cache_key    = 'prc_sitemap_years_with_posts';
+		$cached_years = get_transient( $cache_key );
+
+		if ( false !== $cached_years ) {
+			return $cached_years;
+		}
 
 		$all_years = self::get_post_year_range();
 
 		$years_with_posts = array();
 		foreach ( $all_years as $year ) {
-			if ( self::date_range_has_posts( self::get_date_stamp( $year, 1, 1 ), self::get_date_stamp( $year, 12, 31 ) ) ) {
+			if ( self::year_has_posts( $year ) ) {
 				$years_with_posts[] = $year;
 			}
 		}
+
+		// Cache for 12 hours (standard duration for sitemap data)
+		set_transient( $cache_key, $years_with_posts, PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
+
 		return $years_with_posts;
+	}
+
+	/**
+	 * Check if a specific year has posts (optimized version).
+	 *
+	 * @param int $year The year to check.
+	 * @return bool True if year has posts.
+	 */
+	public static function year_has_posts( $year ) {
+		$cache_key     = "prc_sitemap_year_has_posts_{$year}";
+		$cached_result = get_transient( $cache_key );
+
+		if ( false !== $cached_result ) {
+			return (bool) $cached_result;
+		}
+
+		$result = self::date_range_has_posts(
+			self::get_date_stamp( $year, 1, 1 ),
+			self::get_date_stamp( $year, 12, 31 )
+		);
+
+		// Cache for 12 hours (standard duration for sitemap data)
+		set_transient( $cache_key, $result ? 1 : 0, PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
+
+		return (bool) $result;
 	}
 
 	/**
@@ -452,13 +613,32 @@ class PRC_Sitemap {
 	 * @return int|false
 	 */
 	public static function date_range_has_posts( $start_date, $end_date ) {
+		// For single day checks, use more specific caching
+		if ( $start_date === $end_date ) {
+			$cache_key     = "prc_sitemap_date_has_posts_{$start_date}";
+			$cached_result = get_transient( $cache_key );
+
+			if ( false !== $cached_result ) {
+				return $cached_result === '1' ? 1 : false;
+			}
+		}
+
 		global $wpdb;
 
 		$start_date .= ' 00:00:00';
 		$end_date   .= ' 23:59:59';
 
 		$post_types_in = self::get_supported_post_types_in();
-		return $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM $wpdb->posts WHERE post_status = 'publish' AND post_date >= %s AND post_date <= %s AND post_type IN ( {$post_types_in} ) LIMIT 1", $start_date, $end_date ) );
+		$result        = $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM $wpdb->posts WHERE post_status = 'publish' AND post_date >= %s AND post_date <= %s AND post_type IN ( {$post_types_in} ) LIMIT 1", $start_date, $end_date ) );
+
+		// Cache single day results for 12 hours (standard duration for sitemap data)
+		if ( substr( $start_date, 0, 10 ) === substr( $end_date, 0, 10 ) ) {
+			$single_date = substr( $start_date, 0, 10 );
+			$cache_key   = "prc_sitemap_date_has_posts_{$single_date}";
+			set_transient( $cache_key, $result ? '1' : '0', PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
+		}
+
+		return $result;
 	}
 
 	/**
@@ -469,19 +649,30 @@ class PRC_Sitemap {
 	 * @return array IDs of posts.
 	 */
 	public static function get_post_ids_for_date( $sitemap_date, $limit = 500 ) {
+		$cache_key  = "prc_sitemap_post_ids_{$sitemap_date}_{$limit}";
+		$cached_ids = get_transient( $cache_key );
+
+		if ( false !== $cached_ids ) {
+			return $cached_ids;
+		}
+
 		global $wpdb;
 
 		$start_date    = $sitemap_date . ' 00:00:00';
 		$end_date      = $sitemap_date . ' 23:59:59';
 		$post_types_in = self::get_supported_post_types_in();
 
-		$posts = $wpdb->get_results( $wpdb->prepare( "SELECT ID, post_date FROM $wpdb->posts WHERE post_status = 'publish' AND post_date >= %s AND post_date <= %s AND post_type IN ( {$post_types_in} ) LIMIT %d", $start_date, $end_date, $limit ) );
+		$posts = $wpdb->get_results( $wpdb->prepare( "SELECT ID, post_date FROM $wpdb->posts WHERE post_status = 'publish' AND post_date >= %s AND post_date <= %s AND post_type IN ( {$post_types_in} ) ORDER BY post_date DESC LIMIT %d", $start_date, $end_date, $limit ) );
 
 		usort( $posts, array( __CLASS__, 'order_by_post_date' ) );
 
 		$post_ids = wp_list_pluck( $posts, 'ID' );
+		$result   = array_map( 'intval', $post_ids );
 
-		return array_map( 'intval', $post_ids );
+		// Cache for 12 hours (standard duration for sitemap data)
+		set_transient( $cache_key, $result, PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
+
+		return $result;
 	}
 
 	/**
@@ -770,6 +961,12 @@ class PRC_Sitemap {
 	 * @param int|boolean $year The year to build the sitemap for.
 	 */
 	public static function build_root_sitemap_xml( $year = false ) {
+		$cache_key  = 'prc_sitemap_root_xml_' . md5( serialize( array( 'year' => $year ) ) );
+		$cached_xml = get_transient( $cache_key );
+
+		if ( false !== $cached_xml ) {
+			return $cached_xml;
+		}
 
 		$xml_prefix = '<?xml version="1.0" encoding="utf-8"?>';
 		global $wpdb;
@@ -807,7 +1004,13 @@ class PRC_Sitemap {
 			$sitemap      = $xml->addChild( 'sitemap' );
 			$sitemap->loc = self::build_sitemap_url( $sitemap_date ); // Manually set the child instead of addChild to prevent "unterminated entity reference" warnings due to encoded ampersands http://stackoverflow.com/a/555039/169478.
 		}
-		return $xml->asXML();
+
+		$result = $xml->asXML();
+
+		// Cache for 12 hours (standard duration for sitemap data)
+		set_transient( $cache_key, $result, PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
+
+		return $result;
 	}
 
 	/**
@@ -1033,10 +1236,10 @@ class PRC_Sitemap {
 
 		// Check cache first.
 		$cache_key   = "tax_lastmod_max_{$taxonomy}";
-		$cached_time = wp_cache_get( $cache_key, 'prc-sitemap' );
+		$cached_time = wp_cache_get( $cache_key, self::CACHE_GROUP );
 
 		if ( false !== $cached_time ) {
-			// return $cached_time;
+			return $cached_time;
 		}
 
 		// Get all term IDs for this taxonomy.
@@ -1049,7 +1252,7 @@ class PRC_Sitemap {
 		);
 
 		if ( empty( $terms ) || is_wp_error( $terms ) ) {
-			// wp_cache_set( $cache_key, false, 'prc-sitemap', DAY_IN_SECONDS );
+			wp_cache_set( $cache_key, false, self::CACHE_GROUP, PRC_Sitemap_Cache::CACHE_TIMES['long'] );
 			return false;
 		}
 
@@ -1069,7 +1272,7 @@ class PRC_Sitemap {
 
 		// If neither exists, cache false result and return.
 		if ( empty( $post_modified ) ) {
-			wp_cache_set( $cache_key, false, 'prc-sitemap', DAY_IN_SECONDS );
+			wp_cache_set( $cache_key, false, self::CACHE_GROUP, PRC_Sitemap_Cache::CACHE_TIMES['long'] );
 			return false;
 		}
 
@@ -1080,10 +1283,74 @@ class PRC_Sitemap {
 			$last_modified = $post_modified;
 		}
 
-		// Cache the result for a day.
-		// wp_cache_set( $cache_key, $last_modified, 'prc-sitemap', DAY_IN_SECONDS );
+		// Cache for 24 hours (long duration for static data that rarely changes)
+		wp_cache_set( $cache_key, $last_modified, self::CACHE_GROUP, PRC_Sitemap_Cache::CACHE_TIMES['long'] );
 
 		return $last_modified;
+	}
+
+	/**
+	 * Invalidate relevant caches when posts are changed.
+	 *
+	 * @param int     $post_id The post ID.
+	 * @param WP_Post $post The post object (optional).
+	 */
+	public static function invalidate_caches_on_post_change( $post_id, $post = null ) {
+		if ( ! $post ) {
+			$post = get_post( $post_id );
+		}
+
+		if ( ! $post || ! in_array( $post->post_type, self::get_supported_post_types(), true ) ) {
+			return;
+		}
+
+		// Invalidate date-based caches using utility class
+		$post_date = get_the_date( 'Y-m-d', $post );
+		if ( $post_date ) {
+			PRC_Sitemap_Cache::invalidate_date_caches( $post_date );
+		}
+
+		// Invalidate general caches
+		delete_transient( 'prc_sitemap_post_year_range' );
+		delete_transient( 'prc_sitemap_years_with_posts' );
+		delete_transient( 'prc_sitemap_count' );
+		delete_transient( 'prc_sitemap_recent_url_counts' );
+		delete_transient( 'prc_sitemap_root_xml_' . md5( serialize( array( 'year' => false ) ) ) );
+
+		// Clear object cache
+		wp_cache_delete( 'sitemap_stats', self::CACHE_GROUP );
+	}
+
+	/**
+	 * Invalidate caches when post status changes.
+	 *
+	 * @param string  $new_status New post status.
+	 * @param string  $old_status Old post status.
+	 * @param WP_Post $post Post object.
+	 */
+	public static function invalidate_caches_on_post_status_change( $new_status, $old_status, $post ) {
+		// Only invalidate if transitioning to/from publish status
+		if ( 'publish' === $new_status || 'publish' === $old_status ) {
+			self::invalidate_caches_on_post_change( $post->ID, $post );
+		}
+	}
+
+	/**
+	 * Clear all sitemap caches.
+	 *
+	 * @return void
+	 */
+	public static function clear_all_caches() {
+		return PRC_Sitemap_Cache::invalidate_all_caches();
+	}
+
+	/**
+	 * Scheduled cache cleanup function.
+	 *
+	 * @return void
+	 */
+	public static function scheduled_cache_cleanup() {
+		PRC_Sitemap_Cache::cleanup_expired_transients();
 	}
 }
 

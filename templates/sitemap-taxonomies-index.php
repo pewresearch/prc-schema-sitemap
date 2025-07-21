@@ -32,12 +32,23 @@ echo '<?xml version="1.0" encoding="UTF-8"?>' . PHP_EOL;
 <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 <?php
 foreach ( $supported_taxonomies as $taxonomy ) {
-	$term_count = wp_count_terms(
-		array(
-			'taxonomy'   => $taxonomy,
-			'hide_empty' => true,
-		)
-	);
+	// Cache term count for performance
+	$cache_key = "prc_sitemap_term_count_{$taxonomy}";
+	$term_count = get_transient( $cache_key );
+	
+	if ( false === $term_count ) {
+		$term_count = wp_count_terms(
+			array(
+				'taxonomy'   => $taxonomy,
+				'hide_empty' => true,
+			)
+		);
+		
+		// Cache for 12 hours (standard duration for sitemap data)
+		if ( ! is_wp_error( $term_count ) ) {
+			set_transient( $cache_key, $term_count, 43200 ); // 12 hours
+		}
+	}
 
 	if ( is_wp_error( $term_count ) || empty( $term_count ) ) {
 		continue;
