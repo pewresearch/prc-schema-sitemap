@@ -62,6 +62,9 @@ class PRC_Sitemap {
 		// Filter to allow the sitemap to be indexed by year.
 		self::$index_by_year = apply_filters( 'prc_sitemap_index_by_year', false );
 
+		// Register default post type support.
+		add_action( 'init', array( __CLASS__, 'register_default_post_type_support' ), 5 );
+
 		// A cron schedule for creating/updating sitemap posts based on updated content since the last run.
 		add_action( 'init', array( __CLASS__, 'sitemap_init' ) );
 		add_action( 'admin_init', array( __CLASS__, 'sitemap_init_cron' ) );
@@ -750,7 +753,7 @@ class PRC_Sitemap {
 			$GLOBALS['post'] = get_post( $post_id );
 			setup_postdata( $GLOBALS['post'] );
 
-			if ( apply_filters( 'prc_sitemap_skip_post', false ) ) {
+			if ( apply_filters( 'prc_sitemap_skip_post', false, $post_id ) ) {
 				continue;
 			}
 
@@ -1128,17 +1131,34 @@ class PRC_Sitemap {
 	}
 
 	/**
+	 * Register default post type support for sitemap.
+	 *
+	 * @hook init
+	 */
+	public static function register_default_post_type_support() {
+		add_post_type_support( 'post', 'prc-sitemap' );
+		add_post_type_support( 'page', 'prc-sitemap' );
+	}
+
+	/**
 	 * Get supported post types
 	 *
 	 * @return array
 	 */
 	public static function get_supported_post_types() {
-		// By default, we index post and page types. You can remove these via filter below.
-		$defaults = array(
-			'post',
-			'page',
+		$post_types         = get_post_types( array( 'public' => true ), 'names' );
+		$supported_types    = array_values(
+			array_filter(
+				$post_types,
+				function ( $pt ) {
+					return post_type_supports( $pt, 'prc-sitemap' );
+				}
+			)
 		);
-		return apply_filters( 'prc_sitemap_supported_post_types', $defaults );
+		// Maintain backward compatibility with filter.
+		$filter_types       = apply_filters( 'prc_sitemap_supported_post_types', array() );
+		$enabled_post_types = array_unique( array_merge( $supported_types, $filter_types ) );
+		return array_values( $enabled_post_types );
 	}
 
 	/**
