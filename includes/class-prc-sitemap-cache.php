@@ -22,13 +22,13 @@ class PRC_Sitemap_Cache {
 	 *
 	 * Three-tier strategy optimized for low-frequency publishing:
 	 * - Short: Admin UI interactions that need quick feedback
-	 * - Standard: All sitemap data (12 hours works well for infrequent publishing)
+	 * - Standard: All sitemap data (24 hours; invalidation hooks handle freshness)
 	 * - Long: Static data that rarely changes
 	 */
 	const CACHE_TIMES = array(
-		'short'    => 900,   // 15 minutes - Admin UI interactions
-		'standard' => 43200, // 12 hours - All sitemap data
-		'long'     => 86400, // 24 hours - Static data
+		'short'    => 900,    // 15 minutes - Admin UI interactions
+		'standard' => 86400,  // 24 hours - All sitemap data
+		'long'     => 172800, // 48 hours - Static data
 	);
 
 	/**
@@ -114,6 +114,21 @@ class PRC_Sitemap_Cache {
 		delete_transient( "prc_sitemap_year_has_posts_{$year}" );
 		self::delete_transients_by_pattern( "prc_sitemap_date_has_posts_{$year}-%" );
 		self::delete_transients_by_pattern( "prc_sitemap_post_ids_{$year}-%" );
+	}
+
+	/**
+	 * Invalidate taxonomy-specific caches.
+	 *
+	 * @param string $taxonomy The taxonomy slug.
+	 * @return void
+	 */
+	public static function invalidate_taxonomy_caches( $taxonomy ) {
+		delete_transient( "prc_sitemap_term_count_{$taxonomy}" );
+		wp_cache_delete( "tax_lastmod_max_{$taxonomy}", self::CACHE_GROUP );
+
+		// Clear cached taxonomy template output.
+		delete_transient( 'prc_sitemap_taxonomy_index_xml' );
+		self::delete_transients_by_pattern( "prc_sitemap_terms_xml_{$taxonomy}_%" );
 	}
 
 	/**

@@ -5,7 +5,8 @@
 * Author: Artur Synowiec, Paul Kevan, Seth Rubenstein,and others
 * Version: 1.5.0
 * Stable tag: 1.5.0
-* License: GPLv2
+* License: GPL-2.0+
+* License URI: http://www.gnu.org/licenses/gpl-2.0.txt
 * Requires Plugins: prc-platform-core
 */
 
@@ -82,6 +83,11 @@ class PRC_Sitemap {
 		add_action( 'wp_trash_post', array( __CLASS__, 'invalidate_caches_on_post_change' ) );
 		add_action( 'untrash_post', array( __CLASS__, 'invalidate_caches_on_post_change' ) );
 		add_action( 'transition_post_status', array( __CLASS__, 'invalidate_caches_on_post_status_change' ), 10, 3 );
+
+		// Taxonomy cache invalidation hooks.
+		add_action( 'created_term', array( __CLASS__, 'invalidate_caches_on_term_change' ), 10, 3 );
+		add_action( 'edited_term', array( __CLASS__, 'invalidate_caches_on_term_change' ), 10, 3 );
+		add_action( 'delete_term', array( __CLASS__, 'invalidate_caches_on_term_change' ), 10, 4 );
 
 		// Cache cleanup cron.
 		add_action( 'prc_sitemap_cache_cleanup', array( __CLASS__, 'scheduled_cache_cleanup' ) );
@@ -333,8 +339,8 @@ class PRC_Sitemap {
 			<p><strong><?php esc_html_e( 'Simplified Cache Strategy:', 'prc-sitemaps' ); ?></strong></p>
 			<ul style="margin-left: 20px;">
 				<li><?php esc_html_e( 'Admin UI responses: 15 minutes', 'prc-sitemaps' ); ?></li>
-				<li><?php esc_html_e( 'All sitemap data: 12 hours (perfect for low-frequency publishing)', 'prc-sitemaps' ); ?></li>
-				<li><?php esc_html_e( 'Static data (year ranges, taxonomies): 24 hours', 'prc-sitemaps' ); ?></li>
+				<li><?php esc_html_e( 'All sitemap data: 24 hours (invalidation hooks handle freshness)', 'prc-sitemaps' ); ?></li>
+				<li><?php esc_html_e( 'Static data (year ranges, taxonomies): 48 hours', 'prc-sitemaps' ); ?></li>
 				<li><?php esc_html_e( 'Caches auto-invalidate immediately when posts are published', 'prc-sitemaps' ); ?></li>
 			</ul>
 		</div>
@@ -1334,8 +1340,9 @@ class PRC_Sitemap {
 		delete_transient( 'prc_sitemap_post_year_range' );
 		delete_transient( 'prc_sitemap_years_with_posts' );
 		delete_transient( 'prc_sitemap_count' );
-		delete_transient( 'prc_sitemap_recent_url_counts' );
-		delete_transient( 'prc_sitemap_root_xml_' . md5( serialize( array( 'year' => false ) ) ) );
+		PRC_Sitemap_Cache::delete_transients_by_pattern( 'prc_sitemap_recent_url_counts_%' );
+		PRC_Sitemap_Cache::delete_transients_by_pattern( 'prc_sitemap_root_xml_%' );
+		PRC_Sitemap_Cache::delete_transients_by_pattern( 'prc_sitemap_news_xml_%' );
 
 		// Clear object cache
 		wp_cache_delete( 'sitemap_stats', self::CACHE_GROUP );
@@ -1353,6 +1360,22 @@ class PRC_Sitemap {
 		if ( 'publish' === $new_status || 'publish' === $old_status ) {
 			self::invalidate_caches_on_post_change( $post->ID, $post );
 		}
+	}
+
+	/**
+	 * Invalidate caches when taxonomy terms are created, edited, or deleted.
+	 *
+	 * @param int      $term_id      Term ID.
+	 * @param int      $tt_id        Term taxonomy ID.
+	 * @param string   $taxonomy     Taxonomy slug.
+	 * @param WP_Term  $deleted_term Deleted term object (only on delete_term).
+	 */
+	public static function invalidate_caches_on_term_change( $term_id, $tt_id, $taxonomy, $deleted_term = null ) {
+		$supported = apply_filters( 'prc_sitemap_supported_taxonomies', array( 'category' ) );
+		if ( ! in_array( $taxonomy, $supported, true ) ) {
+			return;
+		}
+		PRC_Sitemap_Cache::invalidate_taxonomy_caches( $taxonomy );
 	}
 
 	/**
