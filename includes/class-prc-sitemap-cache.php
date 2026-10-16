@@ -65,15 +65,19 @@ class PRC_Sitemap_Cache {
 	}
 
 	/**
-	 * Batch delete transients by pattern.
+	 * Batch delete transients by SQL LIKE pattern.
 	 *
-	 * @param string $pattern SQL LIKE pattern for transient names.
-	 * @return int Number of transients deleted.
+	 * The caller is responsible for passing a valid SQL LIKE pattern where `%`
+	 * and `_` act as wildcards. Literal `%` or `_` characters in the non-wildcard
+	 * portion of the prefix must be pre-escaped by the caller with `$wpdb->esc_like()`.
+	 * All existing call sites use a trailing `%` wildcard only (e.g.
+	 * `'prc_sitemap_post_ids_2026-03-11_%'`), which is the expected usage.
+	 *
+	 * @param string $pattern SQL LIKE pattern for transient names (wildcards preserved).
+	 * @return int Number of option rows deleted (each transient = 2 rows: value + timeout).
 	 */
 	public static function delete_transients_by_pattern( $pattern ) {
 		global $wpdb;
-
-		$pattern = $wpdb->esc_like( $pattern );
 
 		// Delete transients and their timeout options.
 		$deleted = $wpdb->query(

@@ -1,5 +1,7 @@
 # PRC Schema Sitemaps
 
+> Canonical docs: [docs/plugins/prc-schema-sitemap/](../../docs/plugins/prc-schema-sitemap/)
+
 Forked from [msm-sitemap](https://github.com/automattic/msm-sitemap).
 
 This fork adds support for taxonomy sitemaps and Google News as well as adding images support to the posts sitemap.
@@ -15,7 +17,6 @@ Comprehensive sitemaps for your WordPress.com VIP site. Joint collaboration betw
 - Avoid memory and timeout problems when rendering heavy sitemap pages with lots of posts.
 - Older archives that are unlikely to change can be served up faster since we're not building them on-demand.
 - Archive pages are rendered on-demand.
-
 
 ### Sitemap Generation
 
@@ -35,20 +36,26 @@ Here's how the default WP-Cron approach works:
 - Move on to the next month and repeat.
 - Move on to next year when we run out of months.
 
-
 ## CLI Commands
 
 The plugin ships with a bunch of wp-cli commands to simplify sitemap creation:
 
 ```
-$ wp prc-sitemap
-usage: wp prc-sitemap generate-sitemap
-   or: wp prc-sitemap generate-sitemap-for-year
-   or: wp prc-sitemap generate-sitemap-for-year-month
-   or: wp prc-sitemap generate-sitemap-for-year-month-day
-   or: wp prc-sitemap recount-indexed-posts
+$ wp prc sitemap
+usage: wp prc sitemap generate-sitemap
+   or: wp prc sitemap generate-sitemap-for-year
+   or: wp prc sitemap generate-sitemap-for-year-month
+   or: wp prc sitemap generate-sitemap-for-year-month-day
+   or: wp prc sitemap export-urls
+   or: wp prc sitemap recount-indexed-posts
 
-See 'wp help prc-sitemap ' for more information on a specific command.
+See 'wp help prc sitemap' for more information on a specific command.
+```
+
+`export-urls` writes CSV (`url,lastmod,source`) to STDOUT. Redirect it to a file:
+
+```
+wp prc sitemap export-urls > sitemap-urls.csv
 ```
 
 ## Filtering Sitemap URLs
@@ -79,4 +86,3 @@ add_filter( 'prc_sitemap_index', function( $sitemaps ) {
     } );
 } );
 ```
-

@@ -32,4 +32,8 @@ echo '<?xml version="1.0" encoding="UTF-8"?>';
 		<loc><?php echo esc_url( home_url( '/sitemap-rls.xml' ) ); ?></loc>
 		<lastmod><?php echo esc_xml( gmdate( 'c', strtotime( 'now' ) ) ); ?></lastmod>
 	</sitemap>
+	<sitemap>
+		<loc><?php echo esc_url( home_url( '/sitemap-religious-projections.xml' ) ); ?></loc>
+		<lastmod><?php echo esc_xml( gmdate( 'c', strtotime( 'now' ) ) ); ?></lastmod>
+	</sitemap>
 </sitemapindex>

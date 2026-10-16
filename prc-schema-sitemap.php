@@ -3,11 +3,11 @@
 * Plugin Name: PRC Schema - Sitemap
 * Description: A plugin for PRC Platform that generates comprehensive sitemaps for your WordPress site. Joint collaboration between Pew Research Center, Metro.co.uk, MAKE, Alley Interactive, and WordPress VIP.
 * Author: Artur Synowiec, Paul Kevan, Seth Rubenstein,and others
-* Version: 1.5.0
-* Stable tag: 1.5.0
+* Version: 1.5.1
+* Stable tag: 1.5.1
 * License: GPL-2.0+
 * License URI: http://www.gnu.org/licenses/gpl-2.0.txt
-* Requires Plugins: prc-platform-core
+* Requires Plugins: prc-scripts
 */
 
 // Load cache utility class.
@@ -75,7 +75,7 @@ class PRC_Sitemap {
 		add_filter( 'template_include', array( __CLASS__, 'load_sitemap_template' ) );
 
 		// Run late so we don't conflict with other plugins.
-		add_filter( 'prc_sitemap_entry', array( __CLASS__, 'add_entry_featured_image' ), 1, 999 );
+		add_filter( 'prc_sitemap_entry', array( __CLASS__, 'add_entry_featured_image' ), 1, 2 );
 
 		// Cache invalidation hooks.
 		add_action( 'save_post', array( __CLASS__, 'invalidate_caches_on_post_change' ), 10, 2 );
@@ -158,6 +158,9 @@ class PRC_Sitemap {
 
 		// RLS Sitemap.
 		add_rewrite_rule( '^sitemap-rls.xml$', 'index.php?sitemap=true&sitemap-type=rls', 'top' );
+
+		// Religious Projections Sitemap.
+		add_rewrite_rule( '^sitemap-religious-projections.xml$', 'index.php?sitemap=true&sitemap-type=religious-projections', 'top' );
 
 		// All public archive taxonomy terms index sitemap.
 		add_rewrite_rule( '^sitemap-taxonomies.xml$', 'index.php?sitemap=true&sitemap-type=taxonomies-index', 'top' );
@@ -482,6 +485,7 @@ class PRC_Sitemap {
 				$output .= 'Sitemap: ' . home_url( '/sitemap-taxonomies.xml' ) . PHP_EOL;
 				$output .= 'Sitemap: ' . home_url( '/sitemap-news.xml' ) . PHP_EOL;
 				$output .= 'Sitemap: ' . home_url( '/sitemap-rls.xml' ) . PHP_EOL;
+				$output .= 'Sitemap: ' . home_url( '/sitemap-religious-projections.xml' ) . PHP_EOL;
 				$output .= PHP_EOL;
 			}
 		}
@@ -741,6 +745,7 @@ class PRC_Sitemap {
 				'xmlns'              => 'http://www.sitemaps.org/schemas/sitemap/0.9',
 				'xmlns:n'            => 'http://www.google.com/schemas/sitemap-news/0.9',
 				'xmlns:image'        => 'http://www.google.com/schemas/sitemap-image/1.1',
+				'xmlns:xhtml'        => 'http://www.w3.org/1999/xhtml',
 				'xsi:schemaLocation' => 'http://www.sitemaps.org/schemas/sitemap/0.9 http://www.sitemaps.org/schemas/sitemap/0.9/sitemap.xsd',
 			)
 		);
@@ -769,7 +774,7 @@ class PRC_Sitemap {
 			$url->addChild( 'changefreq', 'monthly' );
 			$url->addChild( 'priority', '0.7' );
 
-			apply_filters( 'prc_sitemap_entry', $url );
+			$url = apply_filters( 'prc_sitemap_entry', $url, $post_id );
 
 			++$url_count;
 		}
@@ -1203,24 +1208,44 @@ class PRC_Sitemap {
 	}
 
 	/**
-	 * Add featured image to sitemap entry
+	 * Add featured image to sitemap entry.
+	 *
+	 * Emits the canonical (un-transformed) attachment URL for each image so
+	 * Google indexes one URL per image instead of a query-string variant
+	 * (e.g. `?resize=1024,…`). On WordPress VIP the File System rewrites
+	 * sized requests to its image transformation service, so emitting a
+	 * sized URL here would teach Google about a per-edge cached variant
+	 * with an unstable ETag — exactly what we are trying to avoid.
 	 *
 	 * @param SimpleXMLElement $entry_xml The sitemap url entry XML.
+	 * @param int              $post_id   The post ID being processed.
 	 * @return SimpleXMLElement The modified sitemap url entry XML.
 	 */
-	public static function add_entry_featured_image( $entry_xml ) {
+	public static function add_entry_featured_image( $entry_xml, $post_id = 0 ) {
+		if ( ! $post_id ) {
+			$post_id = get_the_ID();
+		}
+
+		if ( ! $post_id ) {
+			return $entry_xml;
+		}
+
 		// Back-compat; if someone is already adding images, don't bother.
 		$existing_images = $entry_xml->children( 'image', true );
 		if ( count( $existing_images ) > 0 ) {
 			return $entry_xml;
 		}
 
-		$images        = array();
-		$thumbnail_url = get_the_post_thumbnail_url( null, 'large' );
+		$images = array();
+		$seen   = array();
+
+		$thumbnail_id  = get_post_thumbnail_id( $post_id );
+		$thumbnail_url = $thumbnail_id ? wp_get_attachment_url( $thumbnail_id ) : '';
+
 		// Get the attachments that are images for the post.
 		$attachments = get_children(
 			array(
-				'post_parent'    => get_the_ID(),
+				'post_parent'    => $post_id,
 				'post_type'      => 'attachment',
 				'numberposts'    => -1,
 				'post_status'    => 'inherit',
@@ -1228,15 +1253,22 @@ class PRC_Sitemap {
 			)
 		);
 		foreach ( $attachments as $attachment ) {
-			$images[] = array(
-				'image:loc' => $attachment->guid,
-			);
+			$url = wp_get_attachment_url( $attachment->ID );
+			if ( ! $url ) {
+				$url = $attachment->guid;
+			}
+			if ( ! $url || isset( $seen[ $url ] ) ) {
+				continue;
+			}
+			$seen[ $url ] = true;
+			$images[]     = array( 'image:loc' => $url );
 		}
-		// If, for some reason, the featured image is not an attachment, add it to the images array.
-		if ( ! in_array( $thumbnail_url, $images ) ) {
-			$images[] = array(
-				'image:loc' => $thumbnail_url,
-			);
+
+		// If, for some reason, the featured image isn't a child attachment of
+		// the post, add it directly so it still appears in the sitemap.
+		if ( $thumbnail_url && ! isset( $seen[ $thumbnail_url ] ) ) {
+			$seen[ $thumbnail_url ] = true;
+			$images[]               = array( 'image:loc' => $thumbnail_url );
 		}
 
 		$images = apply_filters( 'prc_sitemap_entry_images', $images );

@@ -1,8 +1,14 @@
 <?php
+// phpcs:ignoreFile -- Pre-existing MSM-sitemap CLI. New commands load from includes/cli/.
 
 // TODO: reduce some of the duplication between the CLI commands and the main class
 
 WP_CLI::add_command( 'prc sitemap', 'PRC_Sitemap_CLI' );
+
+require_once __DIR__ . '/class-prc-sitemap-xml-urls.php';
+if ( class_exists( 'WPCOM_VIP_CLI_Command' ) ) {
+	require_once __DIR__ . '/cli/class-prc-sitemap-export-urls-command.php';
+}
 
 class PRC_Sitemap_CLI extends WP_CLI_Command {
 	/**
@@ -215,6 +221,102 @@ class PRC_Sitemap_CLI extends WP_CLI_Command {
 		return true;
 	}
 
+
+	/**
+	 * Generate (or regenerate) sitemaps for every day in a date range.
+	 *
+	 * Useful for backfilling dates that were affected by a bug, or for
+	 * manually triggering a bulk rebuild after a data migration.
+	 *
+	 * ## OPTIONS
+	 *
+	 * [--start=<start-date>]
+	 * : Start date (inclusive) in Y-m-d format. Defaults to 7 days ago.
+	 *
+	 * [--end=<end-date>]
+	 * : End date (inclusive) in Y-m-d format. Defaults to today.
+	 *
+	 * [--clear-cache]
+	 * : When set, invalidates date-specific transient caches before rebuilding each day.
+	 *
+	 * @subcommand generate-sitemap-for-date-range
+	 * @synopsis [--start=<start-date>] [--end=<end-date>] [--clear-cache]
+	 */
+	public function generate_sitemap_for_date_range( $args, $assoc_args ) {
+		$assoc_args = wp_parse_args(
+			$assoc_args,
+			array(
+				'start'       => date( 'Y-m-d', strtotime( '-7 days' ) ),
+				'end'         => date( 'Y-m-d' ),
+				'clear-cache' => false,
+			)
+		);
+
+		$start_date  = $assoc_args['start'];
+		$end_date    = $assoc_args['end'];
+		$clear_cache = (bool) $assoc_args['clear-cache'];
+
+		if ( ! strtotime( $start_date ) ) {
+			WP_CLI::error( 'Invalid --start date. Use Y-m-d format.' );
+		}
+		if ( ! strtotime( $end_date ) ) {
+			WP_CLI::error( 'Invalid --end date. Use Y-m-d format.' );
+		}
+		if ( strtotime( $start_date ) > strtotime( $end_date ) ) {
+			WP_CLI::error( '--start must be before or equal to --end.' );
+		}
+
+		$current = strtotime( $start_date );
+		$end     = strtotime( $end_date );
+		$now     = time();
+
+		WP_CLI::line( sprintf( 'Generating sitemaps from %s to %s%s...', $start_date, $end_date, $clear_cache ? ' (clearing cache each day)' : '' ) );
+
+		$generated = 0;
+		$deleted   = 0;
+		$skipped   = 0;
+
+		while ( $current <= $end ) {
+			if ( $this->halt_execution() ) {
+				delete_option( 'prc_stop_processing' );
+				WP_CLI::warning( 'Halted by prc_stop_processing flag.' );
+				break;
+			}
+
+			$date_stamp = date( 'Y-m-d', $current );
+
+			// Skip future dates.
+			if ( $current > $now ) {
+				WP_CLI::debug( "Skipping future date {$date_stamp}." );
+				++$skipped;
+				$current = strtotime( '+1 day', $current );
+				continue;
+			}
+
+			if ( $clear_cache ) {
+				PRC_Sitemap_Cache::invalidate_date_caches( $date_stamp );
+			}
+
+			if ( PRC_Sitemap::date_range_has_posts( $date_stamp, $date_stamp ) ) {
+				PRC_Sitemap::generate_sitemap_for_date( $date_stamp );
+				WP_CLI::line( "Generated: {$date_stamp}" );
+				++$generated;
+			} else {
+				PRC_Sitemap::delete_sitemap_for_date( $date_stamp );
+				WP_CLI::debug( "No posts on {$date_stamp} — sitemap deleted if it existed." );
+				++$deleted;
+			}
+
+			$current = strtotime( '+1 day', $current );
+		}
+
+		WP_CLI::success( sprintf(
+			'Done. Generated: %d, Cleaned: %d, Skipped: %d.',
+			$generated,
+			$deleted,
+			$skipped
+		) );
+	}
 
 	/**
 	 * @subcommand recount-indexed-posts
