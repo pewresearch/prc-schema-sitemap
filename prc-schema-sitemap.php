@@ -7,7 +7,7 @@
 * Stable tag: 1.5.1
 * License: GPL-2.0+
 * License URI: http://www.gnu.org/licenses/gpl-2.0.txt
-* Requires Plugins: prc-scripts
+* Requires Plugins: prc-shared
 */
 
 // Load cache utility class.
