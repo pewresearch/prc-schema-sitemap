@@ -1,6 +1,6 @@
 {
 	"name": "@prc/schema-sitemap",
-	"version": "1.5.1",
+	"version": "1.5.2",
 	"description": "Generates comprehensive sitemaps for PRC Platform, including post, taxonomy, image, and Google News sitemaps. Joint collaboration between Pew Research Center, Metro.co.uk, MAKE, Alley Interactive, and WordPress VIP.",
 	"private": true,
 	"scripts": {
