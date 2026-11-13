@@ -6,8 +6,12 @@
 WP_CLI::add_command( 'prc sitemap', 'PRC_Sitemap_CLI' );
 
 require_once __DIR__ . '/class-prc-sitemap-xml-urls.php';
+if ( ! class_exists( 'PRC_Sitemap_Builder_Cron' ) ) {
+	require_once __DIR__ . '/prc-sitemap-builder-cron.php';
+}
 if ( class_exists( 'WPCOM_VIP_CLI_Command' ) ) {
 	require_once __DIR__ . '/cli/class-prc-sitemap-export-urls-command.php';
+	require_once __DIR__ . '/cli/class-prc-sitemap-dedupe-command.php';
 }
 
 class PRC_Sitemap_CLI extends WP_CLI_Command {
@@ -22,25 +26,58 @@ class PRC_Sitemap_CLI extends WP_CLI_Command {
 	private $halt = false;
 
 	/**
+	 * @var bool Whether this process holds the lease of the full build.
+	 */
+	private $owns_build = false;
+
+	/**
+	 * @var string The lease token of the full build this process owns, or ''.
+	 */
+	private $build_token = '';
+
+	/**
 	 * Generate full sitemap for site
+	 *
+	 * Exits with an error while another full build holds the build lease.
 	 *
 	 * @subcommand generate-sitemap
 	 */
 	function generate_sitemap( $args, $assoc_args ) {
 		$this->command = 'all';
 
+		$this->build_token = PRC_Sitemap_Builder_Cron::begin_build();
+		if ( '' === $this->build_token ) {
+			WP_CLI::error( 'A full sitemap build is already running.' );
+		}
+		$this->owns_build = true;
+		PRC_Sitemap_Builder_Cron::drop_walk_events();
+
 		$all_years_with_posts = PRC_Sitemap::check_year_has_posts();
 
 		$sitemap_args = array();
 		foreach ( $all_years_with_posts as $year ) {
 			if ( $this->halt_execution() ) {
-				delete_option( 'prc_stop_processing' );
 				break;
 			}
 
 			$sitemap_args['year'] = $year;
 			$this->generate_sitemap_for_year( array(), $sitemap_args );
 		}
+
+		$this->owns_build  = false;
+		$this->build_token = '';
+		if ( ! $this->halt ) {
+			PRC_Sitemap_Builder_Cron::end_build();
+		}
+	}
+
+	/**
+	 * Show the state of the full build: idle, running, or halting.
+	 *
+	 * @subcommand build-state
+	 */
+	function build_state() {
+		WP_CLI::line( PRC_Sitemap_Builder_Cron::get_build_state() );
 	}
 
 	/**
@@ -80,10 +117,6 @@ class PRC_Sitemap_CLI extends WP_CLI_Command {
 
 		foreach ( $months as $month ) {
 			if ( $this->halt_execution() ) {
-				if ( 'year' === $this->command ) {
-					delete_option( 'prc_stop_processing' );
-				}
-
 				break;
 			}
 
@@ -135,10 +168,6 @@ class PRC_Sitemap_CLI extends WP_CLI_Command {
 
 		foreach ( $days as $day ) {
 			if ( $this->halt_execution() ) {
-				if ( 'month' === $this->command ) {
-					delete_option( 'prc_stop_processing' );
-				}
-
 				break;
 			}
 
@@ -179,10 +208,27 @@ class PRC_Sitemap_CLI extends WP_CLI_Command {
 		WP_CLI::line( sprintf( 'Generating sitemap for %s-%s-%s (%s)', $year, $month, $day, implode( ', ', $enabled_post_types ) ) );
 
 		$date_stamp = PRC_Sitemap::get_date_stamp( $year, $month, $day );
-		if ( PRC_Sitemap::date_range_has_posts( $date_stamp, $date_stamp ) ) {
-			PRC_Sitemap::generate_sitemap_for_date( $date_stamp ); // TODO: simplify; this function should accept the year, month, day and translate accordingly
+		$has_posts  = PRC_Sitemap::read_date_range_has_posts( $date_stamp, $date_stamp );
+		if ( is_wp_error( $has_posts ) ) {
+			WP_CLI::warning( sprintf( 'Skipped %s: a read failed, so its sitemap was kept (%s). Run the command again.', $date_stamp, $has_posts->get_error_message() ) );
+			return;
+		}
+
+		if ( $has_posts ) {
+			// TODO: simplify; this function should accept the year, month, day and translate accordingly.
+			$built = PRC_Sitemap::generate_sitemap_for_date( $date_stamp );
+			if ( is_wp_error( $built ) ) {
+				WP_CLI::warning( sprintf( 'Skipped %s: a read failed, so its sitemap was kept (%s). Run the command again.', $date_stamp, $built->get_error_message() ) );
+			} elseif ( ! $built ) {
+				WP_CLI::warning( sprintf( 'Skipped %s: another build of this date is running. Run the command again when it ends.', $date_stamp ) );
+			}
 		} else {
-			PRC_Sitemap::delete_sitemap_for_date( $date_stamp );
+			$deleted = PRC_Sitemap::delete_sitemap_for_date( $date_stamp );
+			if ( is_wp_error( $deleted ) ) {
+				WP_CLI::warning( sprintf( 'Skipped %s: a read failed, so its sitemap was kept (%s). Run the command again.', $date_stamp, $deleted->get_error_message() ) );
+			} elseif ( null === $deleted ) {
+				WP_CLI::warning( sprintf( 'Skipped %s: another build of this date is running. Run the command again when it ends.', $date_stamp ) );
+			}
 		}
 	}
 
@@ -278,8 +324,7 @@ class PRC_Sitemap_CLI extends WP_CLI_Command {
 
 		while ( $current <= $end ) {
 			if ( $this->halt_execution() ) {
-				delete_option( 'prc_stop_processing' );
-				WP_CLI::warning( 'Halted by prc_stop_processing flag.' );
+				WP_CLI::warning( 'Halted: the full sitemap build is halting.' );
 				break;
 			}
 
@@ -294,17 +339,37 @@ class PRC_Sitemap_CLI extends WP_CLI_Command {
 			}
 
 			if ( $clear_cache ) {
-				PRC_Sitemap_Cache::invalidate_date_caches( $date_stamp );
+				PRC_Sitemap_Cache::bump();
 			}
 
-			if ( PRC_Sitemap::date_range_has_posts( $date_stamp, $date_stamp ) ) {
-				PRC_Sitemap::generate_sitemap_for_date( $date_stamp );
-				WP_CLI::line( "Generated: {$date_stamp}" );
-				++$generated;
+			$has_posts = PRC_Sitemap::read_date_range_has_posts( $date_stamp, $date_stamp );
+			if ( is_wp_error( $has_posts ) ) {
+				WP_CLI::warning( "Skipped {$date_stamp}: a read failed, so its sitemap was kept ({$has_posts->get_error_message()})." );
+				++$skipped;
+			} elseif ( $has_posts ) {
+				$built = PRC_Sitemap::generate_sitemap_for_date( $date_stamp );
+				if ( is_wp_error( $built ) ) {
+					WP_CLI::warning( "Skipped {$date_stamp}: a read failed, so its sitemap was kept ({$built->get_error_message()})." );
+					++$skipped;
+				} elseif ( $built ) {
+					WP_CLI::line( "Generated: {$date_stamp}" );
+					++$generated;
+				} else {
+					WP_CLI::warning( "Skipped {$date_stamp}: another build of this date is running." );
+					++$skipped;
+				}
 			} else {
-				PRC_Sitemap::delete_sitemap_for_date( $date_stamp );
-				WP_CLI::debug( "No posts on {$date_stamp} — sitemap deleted if it existed." );
-				++$deleted;
+				$removed = PRC_Sitemap::delete_sitemap_for_date( $date_stamp );
+				if ( is_wp_error( $removed ) ) {
+					WP_CLI::warning( "Skipped {$date_stamp}: a read failed, so its sitemap was kept ({$removed->get_error_message()})." );
+					++$skipped;
+				} elseif ( null === $removed ) {
+					WP_CLI::warning( "Skipped {$date_stamp}: another build of this date is running." );
+					++$skipped;
+				} else {
+					WP_CLI::debug( "No posts on {$date_stamp} — sitemap deleted if it existed." );
+					++$deleted;
+				}
 			}
 
 			$current = strtotime( '+1 day', $current );
@@ -348,13 +413,8 @@ class PRC_Sitemap_CLI extends WP_CLI_Command {
 			$sitemap_count += 1;
 		}
 
-		update_option( 'prc_sitemap_indexed_url_count', $total_count, false );
-		
-		// Clear related caches after recount
-		delete_transient( 'prc_sitemap_count' );
-		delete_transient( 'prc_sitemap_recent_url_counts' );
-		wp_cache_delete( 'sitemap_stats', PRC_Sitemap::CACHE_GROUP );
-		
+		PRC_Sitemap_Cache::bump();
+
 		WP_CLI::line( sprintf( 'Total posts found: %s', $total_count ) );
 		WP_CLI::line( sprintf( 'Number of sitemaps found: %s', $sitemap_count ) );
 	}
@@ -365,21 +425,17 @@ class PRC_Sitemap_CLI extends WP_CLI_Command {
 	 * @subcommand clear-cache
 	 */
 	public function clear_cache() {
-		$deleted = PRC_Sitemap_Cache::invalidate_all_caches();
-		WP_CLI::success( sprintf( 'Cleared %d cached items.', $deleted ) );
+		$versions = PRC_Sitemap_Cache::invalidate_all_caches();
+		WP_CLI::success( sprintf( 'Retired every cached sitemap item. Cache version %s replaces %s.', substr( $versions['current'], 0, 8 ), substr( $versions['previous'], 0, 8 ) ) );
 	}
 
 	/**
-	 * Show cache statistics
+	 * Show the current cache version
 	 *
 	 * @subcommand cache-stats
 	 */
 	public function cache_stats() {
-		$stats = PRC_Sitemap_Cache::get_cache_stats();
-		
-		WP_CLI::line( sprintf( 'Transients: %d', $stats['transients'] ) );
-		WP_CLI::line( sprintf( 'Timeouts: %d', $stats['timeouts'] ) );
-		WP_CLI::line( sprintf( 'Total: %d', $stats['total'] ) );
+		WP_CLI::line( sprintf( 'Cache version: %s', substr( PRC_Sitemap_Cache::version(), 0, 8 ) ) );
 	}
 
 	/**
@@ -391,16 +447,6 @@ class PRC_Sitemap_CLI extends WP_CLI_Command {
 		WP_CLI::line( 'Preloading sitemap caches...' );
 		PRC_Sitemap_Cache::preload_caches();
 		WP_CLI::success( 'Cache preloading completed.' );
-	}
-
-	/**
-	 * Clean up expired transients
-	 *
-	 * @subcommand cleanup-cache
-	 */
-	public function cleanup_cache() {
-		$deleted = PRC_Sitemap_Cache::cleanup_expired_transients();
-		WP_CLI::success( sprintf( 'Cleaned up %d expired cache items.', $deleted ) );
 	}
 
 	/**
@@ -436,17 +482,21 @@ class PRC_Sitemap_CLI extends WP_CLI_Command {
 	}
 
 	/**
-	 * Check if the user has flagged to bail on sitemap generation.
+	 * Check if the build is halting, or lost its lease, so the command must stop.
 	 *
-	 * Once `$this->halt` is set, we take advantage of PHP's boolean operator to stop querying the option in hopes of
-	 * limiting database interaction.
+	 * The full build owns the lease and renews it at each check. Every other
+	 * command stops when a full build is halting. Once `$this->halt` is set the
+	 * command stops without more reads.
 	 *
 	 * @return bool
 	 */
 	private function halt_execution() {
-		if ( $this->halt || get_option( 'prc_stop_processing' ) ) {
-			// Allow user to bail out of the current process, doesn't remove where the job got up to
-			delete_option( 'prc_sitemap_create_in_progress' );
+		if ( $this->halt ) {
+			return true;
+		}
+
+		$may_continue = $this->owns_build ? PRC_Sitemap_Builder_Cron::walk_may_continue( $this->build_token ) : ! PRC_Sitemap_Builder_Cron::is_halting();
+		if ( ! $may_continue ) {
 			$this->halt = true;
 			return true;
 		}

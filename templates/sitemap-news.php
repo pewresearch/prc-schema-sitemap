@@ -18,7 +18,7 @@ $sitemap_dates = array(
 	gmdate( 'Y-m-d', time() - DAY_IN_SECONDS ),
 );
 $date_hash     = md5( implode( '_', $sitemap_dates ) );
-$cache_key     = "prc_sitemap_news_xml_{$date_hash}";
+$cache_key     = PRC_Sitemap_Cache::versioned_key( "prc_sitemap_news_xml_{$date_hash}" );
 
 $xml = PRC_Sitemap_Cache::get_cached_data(
 	$cache_key,

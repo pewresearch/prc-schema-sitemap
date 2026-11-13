@@ -1,14 +1,18 @@
-<?php
-/*
-* Plugin Name: PRC Schema - Sitemap
-* Description: A plugin for PRC Platform that generates comprehensive sitemaps for your WordPress site. Joint collaboration between Pew Research Center, Metro.co.uk, MAKE, Alley Interactive, and WordPress VIP.
-* Author: Artur Synowiec, Paul Kevan, Seth Rubenstein,and others
-* Version: 1.5.1
-* Stable tag: 1.5.1
-* License: GPL-2.0+
-* License URI: http://www.gnu.org/licenses/gpl-2.0.txt
-* Requires Plugins: prc-shared
-*/
+<?php // phpcs:ignore WordPress.Files.FileName.InvalidClassFileName -- WordPress loads the plugin by this file name.
+/**
+ * Plugin Name: PRC Schema - Sitemap
+ * Description: A plugin for PRC Platform that generates comprehensive sitemaps for your WordPress site. Joint collaboration between Pew Research Center, Metro.co.uk, MAKE, Alley Interactive, and WordPress VIP.
+ * Author: Artur Synowiec, Paul Kevan, Seth Rubenstein,and others
+ * Version: 1.5.1
+ * Stable tag: 1.5.1
+ * License: GPL-2.0+
+ * License URI: http://www.gnu.org/licenses/gpl-2.0.txt
+ * Requires Plugins: prc-shared
+ *
+ * @package PRC\Sitemap
+ */
+
+use PRC\Primitives\Concurrency\Lease;
 
 // Load cache utility class.
 require __DIR__ . '/includes/class-prc-sitemap-cache.php';
@@ -45,6 +49,50 @@ class PRC_Sitemap {
 	const CACHE_GROUP = 'prc_sitemap';
 
 	/**
+	 * Cron hooks the plugin schedules events on.
+	 *
+	 * @var string[]
+	 */
+	const CRON_HOOKS = array(
+		'prc_cron_update_sitemap',
+		'prc_cron_generate_sitemap_for_year',
+		'prc_cron_generate_sitemap_for_year_month',
+		'prc_cron_generate_sitemap_for_year_month_day',
+	);
+
+	/**
+	 * Prefix of the lease row of one date: prc_sitemap_date_{Y-m-d}.
+	 *
+	 * @var string
+	 */
+	const DATE_LEASE_PREFIX = 'prc_sitemap_date_';
+
+	/**
+	 * Seconds one build of a date holds its lease. A build of one date takes seconds.
+	 *
+	 * @var int
+	 */
+	const DATE_LEASE_TTL = 300;
+
+	/**
+	 * Seconds the update window ends before time(). wp_insert_post() stamps
+	 * post_modified_gmt before it writes the row, so a row can appear after a
+	 * pass has read past its stamp.
+	 *
+	 * @var int
+	 */
+	const UPDATE_WINDOW_LAG = 60;
+
+	/**
+	 * The longest span of post_modified_gmt one pass reads, in seconds. After
+	 * an outage the first pass reads this much and leaves the cursor at the
+	 * end of it. The next passes read on.
+	 *
+	 * @var int
+	 */
+	const UPDATE_WINDOW_MAX = DAY_IN_SECONDS;
+
+	/**
 	 * Whether the sitemap is indexed by year.
 	 *
 	 * @var bool
@@ -79,26 +127,28 @@ class PRC_Sitemap {
 
 		// Cache invalidation hooks.
 		add_action( 'save_post', array( __CLASS__, 'invalidate_caches_on_post_change' ), 10, 2 );
-		add_action( 'delete_post', array( __CLASS__, 'invalidate_caches_on_post_change' ) );
-		add_action( 'wp_trash_post', array( __CLASS__, 'invalidate_caches_on_post_change' ) );
-		add_action( 'untrash_post', array( __CLASS__, 'invalidate_caches_on_post_change' ) );
+		add_action( 'deleted_post', array( __CLASS__, 'invalidate_caches_on_post_change' ), 10, 2 );
 		add_action( 'transition_post_status', array( __CLASS__, 'invalidate_caches_on_post_status_change' ), 10, 3 );
+
+		// Changes that the update pass cannot see in post_modified_gmt.
+		add_action( 'post_updated', array( __CLASS__, 'queue_dates_on_post_date_change' ), 10, 3 );
+		add_action( 'transition_post_status', array( __CLASS__, 'queue_date_on_publish' ), 10, 3 );
+		add_action( 'before_delete_post', array( __CLASS__, 'queue_date_on_hard_delete' ), 10, 2 );
 
 		// Taxonomy cache invalidation hooks.
 		add_action( 'created_term', array( __CLASS__, 'invalidate_caches_on_term_change' ), 10, 3 );
 		add_action( 'edited_term', array( __CLASS__, 'invalidate_caches_on_term_change' ), 10, 3 );
 		add_action( 'delete_term', array( __CLASS__, 'invalidate_caches_on_term_change' ), 10, 4 );
 
-		// Cache cleanup cron.
-		add_action( 'prc_sitemap_cache_cleanup', array( __CLASS__, 'scheduled_cache_cleanup' ) );
-		if ( ! wp_next_scheduled( 'prc_sitemap_cache_cleanup' ) ) {
-			wp_schedule_event( time(), 'daily', 'prc_sitemap_cache_cleanup' );
+		// The daily cleanup of transient rows went away with the SQL pattern deletes.
+		if ( wp_next_scheduled( 'prc_sitemap_cache_cleanup' ) ) {
+			wp_unschedule_hook( 'prc_sitemap_cache_cleanup' );
 		}
 
 		// By default, we use wp-cron to help generate the full sitemap.
 		// However, this will let us override it, if necessary.
 		if ( true === apply_filters( 'prc_sitemap_use_cron_builder', true ) ) {
-			require __DIR__ . '/includes/prc-sitemap-builder-cron.php';
+			require_once __DIR__ . '/includes/prc-sitemap-builder-cron.php';
 			PRC_Sitemap_Builder_Cron::setup();
 		}
 	}
@@ -195,7 +245,7 @@ class PRC_Sitemap {
 		check_admin_referer( 'prc-sitemap-action' );
 
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( __( 'You do not have sufficient permissions to access this page.', 'prc-sitemaps' ) );
+			wp_die( esc_html__( 'You do not have sufficient permissions to access this page.', 'prc-sitemaps' ) );
 		}
 
 		$n = 10;
@@ -203,8 +253,8 @@ class PRC_Sitemap {
 			$n = intval( $_REQUEST['num_days'] );
 		}
 
-		// Try to get cached stats first
-		$cache_key   = "sitemap_ajax_stats_{$n}";
+		// Try to get cached stats first.
+		$cache_key   = PRC_Sitemap_Cache::versioned_key( "sitemap_ajax_stats_{$n}" );
 		$cached_data = wp_cache_get( $cache_key, self::CACHE_GROUP );
 
 		if ( false !== $cached_data ) {
@@ -218,7 +268,7 @@ class PRC_Sitemap {
 			'sitemap_indexed_urls' => self::get_recent_sitemap_url_counts( $n ),
 		);
 
-		// Cache for 15 minutes (short duration for admin UI feedback)
+		// Cache for 15 minutes (short duration for admin UI feedback).
 		wp_cache_set( $cache_key, $data, self::CACHE_GROUP, PRC_Sitemap_Cache::CACHE_TIMES['short'] );
 
 		wp_send_json( $data );
@@ -229,7 +279,7 @@ class PRC_Sitemap {
 	 */
 	public static function render_sitemap_options_page() {
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( __( 'You do not have sufficient permissions to access this page.', 'prc-sitemaps' ) );
+			wp_die( esc_html__( 'You do not have sufficient permissions to access this page.', 'prc-sitemaps' ) );
 		}
 
 		// Array of possible user actions.
@@ -237,8 +287,7 @@ class PRC_Sitemap {
 
 		// Start outputting HTML.
 		echo '<div class="wrap">';
-		screen_icon();
-		echo '<h2>' . __( 'Sitemap', 'prc-sitemaps' ) . '</h2>';
+		echo '<h2>' . esc_html__( 'Sitemap', 'prc-sitemaps' ) . '</h2>';
 
 		if ( ! self::is_blog_public() ) {
 			self::show_action_message( __( 'Oops! Sitemaps are not supported on private blogs. Please make your blog public and try again.', 'prc-sitemaps' ), 'error' );
@@ -249,20 +298,17 @@ class PRC_Sitemap {
 		if ( isset( $_POST['action'] ) ) {
 			check_admin_referer( 'prc-sitemap-action' );
 
-			// Handle cache actions
+			// Handle cache actions.
 			if ( isset( $_POST['cache_action'] ) ) {
 				switch ( $_POST['cache_action'] ) {
 					case 'clear':
-						$deleted = self::clear_all_caches();
-						self::show_action_message( sprintf( __( 'Cleared %d cached items.', 'prc-sitemaps' ), $deleted ) );
+						$versions = self::clear_all_caches();
+						/* translators: 1: new cache version, 2: previous cache version. */
+						self::show_action_message( sprintf( __( 'Retired every cached sitemap item. Cache version %1$s replaces %2$s.', 'prc-sitemaps' ), substr( $versions['current'], 0, 8 ), substr( $versions['previous'], 0, 8 ) ) );
 						break;
 					case 'preload':
 						PRC_Sitemap_Cache::preload_caches();
 						self::show_action_message( __( 'Cache preloading completed.', 'prc-sitemaps' ) );
-						break;
-					case 'cleanup':
-						$deleted = PRC_Sitemap_Cache::cleanup_expired_transients();
-						self::show_action_message( sprintf( __( 'Cleaned up %d expired cache items.', 'prc-sitemaps' ), $deleted ) );
 						break;
 				}
 			} else {
@@ -278,29 +324,38 @@ class PRC_Sitemap {
 		}
 
 		// All the settings we need to read to display the page.
-		$sitemap_create_in_progress = get_option( 'prc_sitemap_create_in_progress' ) === true;
-		$sitemap_update_last_run    = get_option( 'prc_sitemap_update_last_run' );
+		$sitemap_update_last_run = get_option( 'prc_sitemap_update_last_run' );
 
 		// Determine sitemap status text.
 		$sitemap_create_status = apply_filters(
 			'prc_sitemap_create_status',
-			$sitemap_create_in_progress ? __( 'Running', 'prc-sitemaps' ) : __( 'Not Running', 'prc-sitemaps' )
+			__( 'Not Running', 'prc-sitemaps' )
 		);
 
 		?>
 		<div class="stats-container">
 			<div class="stats-box"><strong id="sitemap-count"><?php echo number_format( self::count_sitemaps() ); ?></strong><?php esc_html_e( 'Sitemaps', 'prc-sitemaps' ); ?></div>
 			<div class="stats-box"><strong id="sitemap-indexed-url-count"><?php echo number_format( self::get_total_indexed_url_count() ); ?></strong><?php esc_html_e( 'Indexed URLs', 'prc-sitemaps' ); ?></div>
-			<div class="stats-footer"><span><span class="noticon noticon-time"></span><?php esc_html_e( 'Updated', 'prc-sitemaps' ); ?> <strong><?php echo human_time_diff( $sitemap_update_last_run ); ?> <?php esc_html_e( 'ago', 'prc-sitemaps' ); ?></strong></span></div>
+			<div class="stats-footer"><span><span class="noticon noticon-time"></span><?php esc_html_e( 'Updated', 'prc-sitemaps' ); ?> <strong><?php echo esc_html( human_time_diff( $sitemap_update_last_run ) ); ?> <?php esc_html_e( 'ago', 'prc-sitemaps' ); ?></strong></span></div>
 		</div>
 
 		<h3><?php esc_html_e( 'Latest Sitemaps', 'prc-sitemaps' ); ?></h3>
 		<div class="stats-container stats-placeholder"></div>
-		<div id="stats-graph-summary"><?php printf( __( 'Max: %1$s on %2$s. Showing the last %3$s days.', 'prc-sitemaps' ), '<span id="stats-graph-max"></span>', '<span id="stats-graph-max-date"></span>', '<span id="stats-graph-num-days"></span>' ); ?></div>
+		<div id="stats-graph-summary">
+		<?php
+		printf(
+			/* translators: 1: most URLs on one day, 2: that day, 3: number of days shown. */
+			esc_html__( 'Max: %1$s on %2$s. Showing the last %3$s days.', 'prc-sitemaps' ),
+			'<span id="stats-graph-max"></span>', // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- empty span that stats.js fills.
+			'<span id="stats-graph-max-date"></span>', // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- empty span that stats.js fills.
+			'<span id="stats-graph-num-days"></span>' // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- empty span that stats.js fills.
+		);
+		?>
+		</div>
 
 		<h3><?php esc_html_e( 'Generate', 'prc-sitemaps' ); ?></h3>
 		<p><strong><?php esc_html_e( 'Sitemap Create Status:', 'prc-sitemaps' ); ?></strong> <?php echo esc_html( $sitemap_create_status ); ?></p>
-		<form action="<?php echo menu_page_url( 'prc-sitemap', false ); ?>" method="post" style="float: left;">
+		<form action="<?php echo esc_url( menu_page_url( 'prc-sitemap', false ) ); ?>" method="post" style="float: left;">
 			<?php wp_nonce_field( 'prc-sitemap-action' ); ?>
 			<?php
 			foreach ( $actions as $action ) :
@@ -315,36 +370,35 @@ class PRC_Sitemap {
 		<div style="clear: both;"></div>
 
 		<h3><?php esc_html_e( 'Cache Management', 'prc-sitemaps' ); ?></h3>
+		<p>
 		<?php
-		$cache_stats = PRC_Sitemap_Cache::get_cache_stats();
+		printf(
+			/* translators: %s: current cache version. */
+			esc_html__( 'Current cache version: %s', 'prc-sitemaps' ),
+			esc_html( substr( PRC_Sitemap_Cache::version(), 0, 8 ) )
+		);
 		?>
-		<p><?php printf( __( 'Current cache items: %1$d transients, %2$d timeouts (Total: %3$d)', 'prc-sitemaps' ), $cache_stats['transients'], $cache_stats['timeouts'], $cache_stats['total'] ); ?></p>
+		</p>
 
-		<form action="<?php echo menu_page_url( 'prc-sitemap', false ); ?>" method="post" style="margin-top: 10px;">
+		<form action="<?php echo esc_url( menu_page_url( 'prc-sitemap', false ) ); ?>" method="post" style="margin-top: 10px;">
 			<?php wp_nonce_field( 'prc-sitemap-action' ); ?>
 			<input type="submit" name="action" class="button-secondary" value="<?php esc_attr_e( 'Clear All Caches', 'prc-sitemaps' ); ?>">
 			<input type="hidden" name="cache_action" value="clear">
 		</form>
 
-		<form action="<?php echo menu_page_url( 'prc-sitemap', false ); ?>" method="post" style="display: inline-block; margin-top: 5px;">
+		<form action="<?php echo esc_url( menu_page_url( 'prc-sitemap', false ) ); ?>" method="post" style="display: inline-block; margin-top: 5px;">
 			<?php wp_nonce_field( 'prc-sitemap-action' ); ?>
 			<input type="submit" name="action" class="button-secondary" value="<?php esc_attr_e( 'Preload Caches', 'prc-sitemaps' ); ?>">
 			<input type="hidden" name="cache_action" value="preload">
-		</form>
-
-		<form action="<?php echo menu_page_url( 'prc-sitemap', false ); ?>" method="post" style="display: inline-block; margin-top: 5px; margin-left: 10px;">
-			<?php wp_nonce_field( 'prc-sitemap-action' ); ?>
-			<input type="submit" name="action" class="button-secondary" value="<?php esc_attr_e( 'Cleanup Expired', 'prc-sitemaps' ); ?>">
-			<input type="hidden" name="cache_action" value="cleanup">
 		</form>
 
 		<div style="margin-top: 15px;">
 			<p><strong><?php esc_html_e( 'Simplified Cache Strategy:', 'prc-sitemaps' ); ?></strong></p>
 			<ul style="margin-left: 20px;">
 				<li><?php esc_html_e( 'Admin UI responses: 15 minutes', 'prc-sitemaps' ); ?></li>
-				<li><?php esc_html_e( 'All sitemap data: 24 hours (invalidation hooks handle freshness)', 'prc-sitemaps' ); ?></li>
+				<li><?php esc_html_e( 'All sitemap data: 24 hours', 'prc-sitemaps' ); ?></li>
 				<li><?php esc_html_e( 'Static data (year ranges, taxonomies): 48 hours', 'prc-sitemaps' ); ?></li>
-				<li><?php esc_html_e( 'Caches auto-invalidate immediately when posts are published', 'prc-sitemaps' ); ?></li>
+				<li><?php esc_html_e( 'A change to a published post, a term, or a sitemap starts a new cache version, and entries from the old version are no longer read', 'prc-sitemaps' ); ?></li>
 			</ul>
 		</div>
 
@@ -361,9 +415,9 @@ class PRC_Sitemap {
 	 */
 	public static function show_action_message( $message, $level = 'notice' ) {
 		$class = 'updated';
-		if ( $level === 'warning' ) {
+		if ( 'warning' === $level ) {
 			$class = 'update-nag';
-		} elseif ( $level === 'error' ) {
+		} elseif ( 'error' === $level ) {
 			$class = 'error';
 		}
 
@@ -376,7 +430,7 @@ class PRC_Sitemap {
 	 * @return int The number of sitemaps that have been generated
 	 */
 	public static function count_sitemaps() {
-		$cache_key    = 'prc_sitemap_count';
+		$cache_key    = PRC_Sitemap_Cache::versioned_key( 'prc_sitemap_count' );
 		$cached_count = get_transient( $cache_key );
 
 		if ( false !== $cached_count ) {
@@ -386,7 +440,6 @@ class PRC_Sitemap {
 		$count  = wp_count_posts( self::SITEMAP_CPT );
 		$result = (int) $count->publish;
 
-		// Cache for 12 hours (standard duration for sitemap data)
 		set_transient( $cache_key, $result, PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
 
 		return $result;
@@ -395,10 +448,31 @@ class PRC_Sitemap {
 	/**
 	 * Gets the current number of URLs indexed by prc-sitemap accross all sitemaps.
 	 *
+	 * The sum of the published sitemaps' prc_indexed_url_count, kept in the
+	 * object cache under the sitemap data version. Every build and every delete
+	 * starts a new version, so the next read sums again. A stored total would
+	 * lose a change when two builds write it at once.
+	 *
+	 * A date that has two sitemap posts counts twice until one is removed.
+	 *
+	 * Only published sitemaps count. The old total counted every status, so on
+	 * a site that holds draft sitemap posts the number steps down once at deploy.
+	 *
 	 * @return int The number of total number URLs indexed
 	 */
 	public static function get_total_indexed_url_count() {
-		return intval( get_option( 'prc_sitemap_indexed_url_count', 0 ) );
+		global $wpdb;
+
+		$cache_key = PRC_Sitemap_Cache::versioned_key( 'prc_sitemap_indexed_url_total' );
+		$cached    = wp_cache_get( $cache_key, self::CACHE_GROUP );
+		if ( false !== $cached ) {
+			return (int) $cached;
+		}
+
+		$total = (int) $wpdb->get_var( $wpdb->prepare( "SELECT SUM( pm.meta_value ) FROM $wpdb->postmeta pm INNER JOIN $wpdb->posts p ON p.ID = pm.post_id WHERE pm.meta_key = %s AND p.post_type = %s AND p.post_status = 'publish'", 'prc_indexed_url_count', self::SITEMAP_CPT ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The result is cached below, under the version.
+		wp_cache_set( $cache_key, $total, self::CACHE_GROUP, DAY_IN_SECONDS );
+
+		return $total;
 	}
 
 	/**
@@ -408,7 +482,7 @@ class PRC_Sitemap {
 	 * @return array An array of sitemap stats
 	 */
 	public static function get_recent_sitemap_url_counts( $n = 7 ) {
-		$cache_key    = "prc_sitemap_recent_url_counts_{$n}";
+		$cache_key    = PRC_Sitemap_Cache::versioned_key( "prc_sitemap_recent_url_counts_{$n}" );
 		$cached_stats = get_transient( $cache_key );
 
 		if ( false !== $cached_stats ) {
@@ -418,14 +492,13 @@ class PRC_Sitemap {
 		$stats = array();
 
 		for ( $i = 0; $i < $n; $i++ ) {
-			$date = date( 'Y-m-d', strtotime( "-$i days" ) );
+			$date = gmdate( 'Y-m-d', strtotime( "-$i days" ) );
 
 			list( $year, $month, $day ) = explode( '-', $date );
 
 			$stats[ $date ] = self::get_indexed_url_count( $year, $month, $day );
 		}
 
-		// Cache for 12 hours (standard duration for sitemap data)
 		set_transient( $cache_key, $stats, PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
 
 		return $stats;
@@ -530,7 +603,7 @@ class PRC_Sitemap {
 	 * @return int[] Valid years.
 	 */
 	public static function get_post_year_range() {
-		$cache_key    = 'prc_sitemap_post_year_range';
+		$cache_key    = PRC_Sitemap_Cache::versioned_key( 'prc_sitemap_post_year_range' );
 		$cached_range = get_transient( $cache_key );
 
 		if ( false !== $cached_range ) {
@@ -543,11 +616,10 @@ class PRC_Sitemap {
 
 		$result = array();
 		if ( null !== $oldest_post_date_year ) {
-			$current_year = date( 'Y' );
+			$current_year = gmdate( 'Y' );
 			$result       = range( (int) $oldest_post_date_year, $current_year );
 		}
 
-		// Cache for 24 hours (long duration for static data that rarely changes)
 		set_transient( $cache_key, $result, PRC_Sitemap_Cache::CACHE_TIMES['long'] );
 
 		return $result;
@@ -559,7 +631,7 @@ class PRC_Sitemap {
 	 * @return int[] Years with posts.
 	 */
 	public static function check_year_has_posts() {
-		$cache_key    = 'prc_sitemap_years_with_posts';
+		$cache_key    = PRC_Sitemap_Cache::versioned_key( 'prc_sitemap_years_with_posts' );
 		$cached_years = get_transient( $cache_key );
 
 		if ( false !== $cached_years ) {
@@ -575,7 +647,6 @@ class PRC_Sitemap {
 			}
 		}
 
-		// Cache for 12 hours (standard duration for sitemap data)
 		set_transient( $cache_key, $years_with_posts, PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
 
 		return $years_with_posts;
@@ -588,7 +659,7 @@ class PRC_Sitemap {
 	 * @return bool True if year has posts.
 	 */
 	public static function year_has_posts( $year ) {
-		$cache_key     = "prc_sitemap_year_has_posts_{$year}";
+		$cache_key     = PRC_Sitemap_Cache::versioned_key( "prc_sitemap_year_has_posts_{$year}" );
 		$cached_result = get_transient( $cache_key );
 
 		if ( false !== $cached_result ) {
@@ -600,7 +671,6 @@ class PRC_Sitemap {
 			self::get_date_stamp( $year, 12, 31 )
 		);
 
-		// Cache for 12 hours (standard duration for sitemap data)
 		set_transient( $cache_key, $result ? 1 : 0, PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
 
 		return (bool) $result;
@@ -623,32 +693,53 @@ class PRC_Sitemap {
 	 *
 	 * @param string $start_date The start date.
 	 * @param string $end_date The end date.
+	 * @param bool   $use_cache False to read the posts table, as the builder does.
 	 * @return int|false
 	 */
-	public static function date_range_has_posts( $start_date, $end_date ) {
-		// For single day checks, use more specific caching
-		if ( $start_date === $end_date ) {
-			$cache_key     = "prc_sitemap_date_has_posts_{$start_date}";
+	public static function date_range_has_posts( $start_date, $end_date, $use_cache = true ) {
+		$cache_key = $start_date === $end_date ? PRC_Sitemap_Cache::versioned_key( "prc_sitemap_date_has_posts_{$start_date}" ) : null;
+		if ( $use_cache && $cache_key ) {
 			$cached_result = get_transient( $cache_key );
 
 			if ( false !== $cached_result ) {
-				return $cached_result === '1' ? 1 : false;
+				return '1' === $cached_result ? 1 : false;
 			}
 		}
 
+		$result = self::read_date_range_has_posts( $start_date, $end_date );
+		if ( is_wp_error( $result ) ) {
+			// A failed read is not "no posts", so it is not cached.
+			return false;
+		}
+
+		if ( $cache_key ) {
+			set_transient( $cache_key, $result ? '1' : '0', PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Read from the posts table whether a date range has a published post.
+	 *
+	 * @param string $start_date The start date, Y-m-d.
+	 * @param string $end_date The end date, Y-m-d.
+	 * @return string|null|WP_Error The ID of a post, null when the range has none, or a WP_Error when the read failed. A failed read returns null too, so a caller that decides to build or to delete must look at the error.
+	 */
+	public static function read_date_range_has_posts( $start_date, $end_date ) {
 		global $wpdb;
 
 		$start_date .= ' 00:00:00';
 		$end_date   .= ' 23:59:59';
 
 		$post_types_in = self::get_supported_post_types_in();
-		$result        = $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM $wpdb->posts WHERE post_status = 'publish' AND post_date >= %s AND post_date <= %s AND post_type IN ( {$post_types_in} ) LIMIT 1", $start_date, $end_date ) );
-
-		// Cache single day results for 12 hours (standard duration for sitemap data)
-		if ( substr( $start_date, 0, 10 ) === substr( $end_date, 0, 10 ) ) {
-			$single_date = substr( $start_date, 0, 10 );
-			$cache_key   = "prc_sitemap_date_has_posts_{$single_date}";
-			set_transient( $cache_key, $result ? '1' : '0', PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
+		$result        = $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM $wpdb->posts WHERE post_status = 'publish' AND post_date >= %s AND post_date <= %s AND post_type IN ( {$post_types_in} ) LIMIT 1", $start_date, $end_date ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $post_types_in joins $wpdb->prepare( '%s' ) values.
+		if ( '' !== (string) $wpdb->last_error ) {
+			return new WP_Error(
+				'prc_sitemap_post_read_failed',
+				sprintf( 'The posts of %s to %s could not be read (%s).', substr( $start_date, 0, 10 ), substr( $end_date, 0, 10 ), (string) $wpdb->last_error ),
+				array( 'date' => substr( $start_date, 0, 10 ) )
+			);
 		}
 
 		return $result;
@@ -662,44 +753,145 @@ class PRC_Sitemap {
 	 * @return array IDs of posts.
 	 */
 	public static function get_post_ids_for_date( $sitemap_date, $limit = 500 ) {
-		$cache_key  = "prc_sitemap_post_ids_{$sitemap_date}_{$limit}";
+		$cache_key  = PRC_Sitemap_Cache::versioned_key( "prc_sitemap_post_ids_{$sitemap_date}_{$limit}" );
 		$cached_ids = get_transient( $cache_key );
 
 		if ( false !== $cached_ids ) {
 			return $cached_ids;
 		}
 
-		global $wpdb;
+		$result = self::query_post_ids_for_date( $sitemap_date, $limit );
+		if ( is_wp_error( $result ) ) {
+			// A failed read is not "no posts", so it is not cached.
+			return array();
+		}
 
-		$start_date    = $sitemap_date . ' 00:00:00';
-		$end_date      = $sitemap_date . ' 23:59:59';
-		$post_types_in = self::get_supported_post_types_in();
-
-		$posts = $wpdb->get_results( $wpdb->prepare( "SELECT ID, post_date FROM $wpdb->posts WHERE post_status = 'publish' AND post_date >= %s AND post_date <= %s AND post_type IN ( {$post_types_in} ) ORDER BY post_date DESC LIMIT %d", $start_date, $end_date, $limit ) );
-
-		usort( $posts, array( __CLASS__, 'order_by_post_date' ) );
-
-		$post_ids = wp_list_pluck( $posts, 'ID' );
-		$result   = array_map( 'intval', $post_ids );
-
-		// Cache for 12 hours (standard duration for sitemap data)
 		set_transient( $cache_key, $result, PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
 
 		return $result;
 	}
 
 	/**
-	 * Generate sitemap for a date; this is where XML is rendered.
+	 * Read the published post IDs for a date from the posts table.
 	 *
-	 * @param string $sitemap_date The date to generate the sitemap for.
+	 * @param string $sitemap_date Date in Y-m-d format.
+	 * @param int    $limit Number of post IDs to return.
+	 * @return int[]|WP_Error IDs of posts. A WP_Error when the read failed: a failed query returns no rows, like a date with no posts, and a caller must not read it as one.
 	 */
-	public static function generate_sitemap_for_date( $sitemap_date ) {
+	public static function query_post_ids_for_date( $sitemap_date, $limit = 500 ) {
 		global $wpdb;
 
+		$start_date    = $sitemap_date . ' 00:00:00';
+		$end_date      = $sitemap_date . ' 23:59:59';
+		$post_types_in = self::get_supported_post_types_in();
+
+		$posts = $wpdb->get_results( $wpdb->prepare( "SELECT ID, post_date FROM $wpdb->posts WHERE post_status = 'publish' AND post_date >= %s AND post_date <= %s AND post_type IN ( {$post_types_in} ) ORDER BY post_date DESC LIMIT %d", $start_date, $end_date, $limit ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $post_types_in joins $wpdb->prepare( '%s' ) values.
+
+		if ( ! is_array( $posts ) || '' !== (string) $wpdb->last_error ) {
+			return new WP_Error(
+				'prc_sitemap_post_read_failed',
+				sprintf( 'The posts of %s could not be read (%s).', $sitemap_date, (string) $wpdb->last_error ),
+				array( 'date' => $sitemap_date )
+			);
+		}
+
+		usort( $posts, array( __CLASS__, 'order_by_post_date' ) );
+
+		$post_ids = wp_list_pluck( $posts, 'ID' );
+
+		return array_map( 'intval', $post_ids );
+	}
+
+	/**
+	 * The lease that one build of a date holds.
+	 *
+	 * @return Lease
+	 */
+	public static function date_lease() {
+		return new Lease( self::DATE_LEASE_PREFIX, self::DATE_LEASE_TTL, 'date_' );
+	}
+
+	/**
+	 * Generate sitemap for a date.
+	 *
+	 * One build of a date runs at a time. The build takes the lease of the date
+	 * first, then looks for the sitemap post of the date, so two builds never
+	 * both find none and both insert one. A build that finds the lease held
+	 * does nothing and returns false. The caller decides when to try again.
+	 *
+	 * @param string $sitemap_date The date to generate the sitemap for.
+	 * @return bool|WP_Error True when this call built the date. False when another build of the date holds the lease. A WP_Error when a read of the date failed: the sitemap of the date is left as it was, and the caller builds the date again later.
+	 */
+	public static function generate_sitemap_for_date( $sitemap_date ) {
+		$lease = self::date_lease();
+		$token = $lease->acquire( $sitemap_date );
+		if ( '' === $token ) {
+			return false;
+		}
+
+		try {
+			$written = self::write_sitemap_for_date( $sitemap_date );
+		} finally {
+			$lease->release( $sitemap_date, $token );
+		}
+
+		return is_wp_error( $written ) ? $written : true;
+	}
+
+	/**
+	 * Find the sitemap post of a date by post_name.
+	 *
+	 * WordPress renames a trashed post to `{post_name}__trashed`, so a lookup of
+	 * the plain name misses it and the build would insert a second post for the
+	 * date. The lookup reads both names. A live post wins, the lowest ID first,
+	 * and a trashed post comes back to `publish` when no live one exists.
+	 * Callers hold the lease of the date.
+	 *
+	 * @param string $sitemap_name The date, which is the post_name of its sitemap post.
+	 * @return int|WP_Error The post ID, or 0 when the date has none. A WP_Error when the read failed: a failed read is not "none", and a build that took it for none would insert a second post for the date.
+	 */
+	private static function find_sitemap_post_id( $sitemap_name ) {
+		global $wpdb;
+
+		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT ID, post_status FROM $wpdb->posts WHERE post_type = %s AND post_name IN ( %s, %s ) ORDER BY ID ASC", self::SITEMAP_CPT, $sitemap_name, $sitemap_name . '__trashed' ) );
+		if ( ! is_array( $rows ) || '' !== (string) $wpdb->last_error ) {
+			return new WP_Error(
+				'prc_sitemap_post_read_failed',
+				sprintf( 'The sitemap post of %s could not be looked up (%s).', $sitemap_name, (string) $wpdb->last_error ),
+				array( 'date' => $sitemap_name )
+			);
+		}
+		if ( empty( $rows ) ) {
+			return 0;
+		}
+
+		foreach ( $rows as $row ) {
+			if ( 'trash' !== $row->post_status ) {
+				return (int) $row->ID;
+			}
+		}
+
+		$trashed_id = (int) $rows[0]->ID;
+		$publish    = static function () {
+			return 'publish';
+		};
+		add_filter( 'wp_untrash_post_status', $publish );
+		wp_untrash_post( $trashed_id );
+		remove_filter( 'wp_untrash_post_status', $publish );
+
+		return $trashed_id;
+	}
+
+	/**
+	 * Write the sitemap post of a date; this is where XML is rendered.
+	 *
+	 * @param string $sitemap_date The date to generate the sitemap for.
+	 * @return true|WP_Error A WP_Error when a read failed. A sitemap post that was there stays as it was. A post that this call inserted is removed.
+	 */
+	private static function write_sitemap_for_date( $sitemap_date ) {
 		list( $year, $month, $day ) = explode( '-', $sitemap_date );
 
-		$sitemap_name   = $sitemap_date;
-		$sitemap_exists = false;
+		$sitemap_name = $sitemap_date;
 
 		$sitemap_data = array(
 			'post_name'   => $sitemap_name,
@@ -709,32 +901,30 @@ class PRC_Sitemap {
 			'post_date'   => $sitemap_date,
 		);
 
-		$sitemap_id = $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM $wpdb->posts WHERE post_type = %s AND post_name = %s LIMIT 1", self::SITEMAP_CPT, $sitemap_name ) );
+		$sitemap_id = self::find_sitemap_post_id( $sitemap_name );
+		if ( is_wp_error( $sitemap_id ) ) {
+			return $sitemap_id;
+		}
 
-		if ( $sitemap_id ) {
-			$sitemap_exists = true;
-		} else {
-			$sitemap_id     = wp_insert_post( $sitemap_data );
-			$sitemap_exists = true;
+		$inserted = ! $sitemap_id;
+		if ( $inserted ) {
+			$sitemap_id = wp_insert_post( $sitemap_data );
 		}
 
 		$per_page = apply_filters( 'prc_sitemap_entry_posts_per_page', self::DEFAULT_POSTS_PER_SITEMAP_PAGE );
-		$post_ids = self::get_post_ids_for_date( $sitemap_date, $per_page );
+		$post_ids = self::query_post_ids_for_date( $sitemap_date, $per_page );
+		if ( is_wp_error( $post_ids ) ) {
+			if ( $inserted ) {
+				// This call made the post and it has no XML yet, so the index would list a date with nothing behind it.
+				self::delete_sitemap_by_id( $sitemap_id );
+			}
+			return $post_ids;
+		}
 
 		if ( empty( $post_ids ) ) {
 			// If no entries - delete the whole sitemap post.
-			if ( $sitemap_exists ) {
-				self::delete_sitemap_by_id( $sitemap_id );
-			}
-			return;
-		}
-
-		$total_url_count = self::get_total_indexed_url_count();
-
-		// For migration: in case the previous version used an array for this option.
-		if ( is_array( $total_url_count ) ) {
-			$total_url_count = array_sum( $total_url_count );
-			update_option( 'prc_sitemap_indexed_url_count', $total_url_count, false );
+			self::delete_sitemap_by_id( $sitemap_id );
+			return true;
 		}
 
 		// SimpleXML doesn't allow us to define namespaces using addAttribute, so we need to specify them in the construction instead.
@@ -761,7 +951,7 @@ class PRC_Sitemap {
 
 		$url_count = 0;
 		foreach ( $post_ids as $post_id ) {
-			$GLOBALS['post'] = get_post( $post_id );
+			$GLOBALS['post'] = get_post( $post_id ); // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited -- get_permalink() and the prc_sitemap_entry filters read the global post; wp_reset_postdata() restores it.
 			setup_postdata( $GLOBALS['post'] );
 
 			if ( apply_filters( 'prc_sitemap_skip_post', false, $post_id ) ) {
@@ -779,51 +969,74 @@ class PRC_Sitemap {
 			++$url_count;
 		}
 
-			// Save the sitemap.
-		if ( $sitemap_exists ) {
-			// Get the previous post count.
-			$previous_url_count = intval( get_post_meta( $sitemap_id, 'prc_indexed_url_count', true ) );
-
-			// Update the total post count with the difference.
-			$total_url_count += $url_count - $previous_url_count;
-
-			update_post_meta( $sitemap_id, 'prc_sitemap_xml', $xml->asXML() );
-			update_post_meta( $sitemap_id, 'prc_indexed_url_count', $url_count );
-			do_action( 'prc_update_sitemap_post', $sitemap_id, $year, $month, $day );
-		} else {
-			/* Should no longer hit this */
-			$sitemap_id = wp_insert_post( $sitemap_data );
-			add_post_meta( $sitemap_id, 'prc_sitemap_xml', $xml->asXML() );
-			add_post_meta( $sitemap_id, 'prc_indexed_url_count', $url_count );
-			do_action( 'prc_insert_sitemap_post', $sitemap_id, $year, $month, $day );
-
-			// Update the total url count.
-			$total_url_count += $url_count;
-		}
-
-		// Update indexed url counts.
-		update_option( 'prc_sitemap_indexed_url_count', $total_url_count, false );
+		update_post_meta( $sitemap_id, 'prc_sitemap_xml', $xml->asXML() );
+		update_post_meta( $sitemap_id, 'prc_indexed_url_count', $url_count );
+		do_action( 'prc_update_sitemap_post', $sitemap_id, $year, $month, $day );
+		PRC_Sitemap_Cache::bump();
 
 		wp_reset_postdata();
+
+		return true;
 	}
 
 	/**
-	 * Delete a sitemap for a given date
+	 * Delete the sitemap of a date that has no posts left.
+	 *
+	 * The delete takes the lease of the date first, as a build does. Without
+	 * it, a delete that read "no posts" could run after a build that had read
+	 * the posts, and a deleted URL would stay in the sitemap, or a date that
+	 * gained a post would lose its sitemap. Under the lease the date reads its
+	 * posts again: when it has gained one, the call builds the date instead.
+	 *
+	 * A failed read is not "no posts". When the lookup of the sitemap post or the read of the posts
+	 * fails, the sitemap stays, the lease goes back, and the call returns a WP_Error so that the caller
+	 * queues the date again.
 	 *
 	 * @param string $sitemap_date The date to delete the sitemap for.
-	 * @return bool True if the sitemap was deleted, false otherwise.
+	 * @return bool|null|WP_Error True if the sitemap was deleted, false if there was nothing to delete, null while a build of the date holds the lease. A WP_Error when a read failed and nothing was deleted. The caller queues the date again on null or on a WP_Error.
 	 */
 	public static function delete_sitemap_for_date( $sitemap_date ) {
+		global $wpdb;
+
 		list( $year, $month, $day ) = explode( '-', $sitemap_date );
+		$wpdb->last_error           = '';
 		$sitemap_id                 = self::get_sitemap_post_id( $year, $month, $day );
 		if ( ! $sitemap_id ) {
+			if ( '' !== (string) $wpdb->last_error ) {
+				return new WP_Error(
+					'prc_sitemap_post_read_failed',
+					sprintf( 'The sitemap post of %s could not be looked up (%s).', $sitemap_date, (string) $wpdb->last_error ),
+					array( 'date' => $sitemap_date )
+				);
+			}
 			return false;
 		}
-		return self::delete_sitemap_by_id( $sitemap_id );
+
+		$lease = self::date_lease();
+		$token = $lease->acquire( $sitemap_date );
+		if ( '' === $token ) {
+			return null;
+		}
+
+		try {
+			$post_ids = self::query_post_ids_for_date( $sitemap_date, 1 );
+			if ( is_wp_error( $post_ids ) ) {
+				return $post_ids;
+			}
+			if ( ! empty( $post_ids ) ) {
+				$written = self::write_sitemap_for_date( $sitemap_date );
+				return is_wp_error( $written ) ? $written : false;
+			}
+			return self::delete_sitemap_by_id( $sitemap_id );
+		} finally {
+			$lease->release( $sitemap_date, $token );
+		}
 	}
 
 	/**
 	 * Delete a sitemap by ID
+	 *
+	 * The caller holds the lease of the sitemap's date.
 	 *
 	 * @param int $sitemap_id The ID of the sitemap to delete.
 	 * @return bool True if the sitemap was deleted, false otherwise.
@@ -834,15 +1047,14 @@ class PRC_Sitemap {
 			return false;
 		}
 
-		$sitemap_date               = date( 'Y-m-d', strtotime( $sitemap->post_date ) );
+		$sitemap_date               = gmdate( 'Y-m-d', strtotime( $sitemap->post_date ) );
 		list( $year, $month, $day ) = explode( '-', $sitemap_date );
 
-		$total_url_count  = self::get_total_indexed_url_count();
-		$total_url_count -= intval( get_post_meta( $sitemap_id, 'prc_indexed_url_count', true ) );
-		update_option( 'prc_sitemap_indexed_url_count', $total_url_count, false );
-
 		wp_delete_post( $sitemap_id, true );
+		PRC_Sitemap_Cache::bump();
 		do_action( 'prc_delete_sitemap_post', $sitemap_id, $year, $month, $day );
+
+		return true;
 	}
 
 	/**
@@ -869,29 +1081,66 @@ class PRC_Sitemap {
 	}
 
 	/**
-	 * Get posts modified within the last hour
+	 * Where the next update window starts.
 	 *
-	 * @return object[] The modified posts.
+	 * The cursor is the end of the last window the pass read, so the next
+	 * window is [cursor, end). It supersedes prc_sitemap_update_last_run, which
+	 * stays only as the start of the first window and as the "Updated ... ago"
+	 * time of the admin page.
+	 *
+	 * @return string GMT datetime.
 	 */
-	public static function get_last_modified_posts() {
-		global $wpdb;
-
-		$sitemap_last_run = get_option( 'prc_sitemap_update_last_run', false );
-
-		$date = date( 'Y-m-d H:i:s', ( time() - 3600 ) ); // posts changed within the last hour.
-
-		if ( $sitemap_last_run ) {
-			$date = date( 'Y-m-d H:i:s', $sitemap_last_run );
+	public static function get_update_cursor() {
+		$cursor = get_option( 'prc_sitemap_update_cursor', false );
+		if ( is_string( $cursor ) && '' !== $cursor ) {
+			return $cursor;
 		}
 
+		$last_run = get_option( 'prc_sitemap_update_last_run', false );
+		return gmdate( 'Y-m-d H:i:s', $last_run ? (int) $last_run : time() - 3600 );
+	}
+
+	/**
+	 * Where the update window that starts at $start ends, exclusive.
+	 *
+	 * The end is UPDATE_WINDOW_LAG seconds before now, and never more than
+	 * UPDATE_WINDOW_MAX after the start.
+	 *
+	 * @param string|null $start GMT datetime. Defaults to the stored cursor.
+	 * @return string GMT datetime.
+	 */
+	public static function get_update_window_end( $start = null ) {
+		$start = $start ?? self::get_update_cursor();
+		$end   = min( time() - self::UPDATE_WINDOW_LAG, strtotime( $start . ' UTC' ) + self::UPDATE_WINDOW_MAX );
+		return gmdate( 'Y-m-d H:i:s', $end );
+	}
+
+	/**
+	 * Every post changed in the window [$start, $end), in one scan.
+	 *
+	 * The query has no LIMIT and no ORDER BY. post_modified_gmt has no index, so
+	 * a second scan or a sort would cost as much as the first read. A post whose
+	 * date is floating (never set) is not in any sitemap and is skipped.
+	 *
+	 * @param string|null $start GMT datetime. Defaults to the stored cursor.
+	 * @param string|null $end   GMT datetime. Defaults to the window end now.
+	 * @return object[] The modified posts: ID, post_date.
+	 */
+	public static function get_last_modified_posts( $start = null, $end = null ) {
+		global $wpdb;
+
+		$start         = $start ?? self::get_update_cursor();
+		$end           = $end ?? self::get_update_window_end( $start );
 		$post_types_in = self::get_supported_post_types_in();
 
-		$modified_posts = $wpdb->get_results( $wpdb->prepare( "SELECT ID, post_date FROM $wpdb->posts WHERE post_type IN ( {$post_types_in} ) AND post_modified_gmt >= %s LIMIT 1000", $date ) );
-		return $modified_posts;
+		return $wpdb->get_results( $wpdb->prepare( "SELECT ID, post_date FROM $wpdb->posts WHERE post_type IN ( {$post_types_in} ) AND post_modified_gmt >= %s AND post_modified_gmt < %s AND post_date_gmt != '0000-00-00 00:00:00'", $start, $end ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $post_types_in joins $wpdb->prepare( '%s' ) values.
 	}
 
 	/**
 	 * Get dates for an array of posts
+	 *
+	 * A post with a floating date (post_date_gmt of zero) has no place in a
+	 * date sitemap, so it adds no date.
 	 *
 	 * @param object[] $posts The posts to get the dates for.
 	 * @return string[] unique dates of each post.
@@ -899,7 +1148,10 @@ class PRC_Sitemap {
 	public static function get_post_dates( $posts ) {
 		$dates = array();
 		foreach ( $posts as $post ) {
-			$dates[] = date( 'Y-m-d', strtotime( $post->post_date ) );
+			if ( isset( $post->post_date_gmt ) && '0000-00-00 00:00:00' === $post->post_date_gmt ) {
+				continue;
+			}
+			$dates[] = gmdate( 'Y-m-d', strtotime( $post->post_date ) );
 		}
 		$dates = array_unique( $dates );
 
@@ -907,26 +1159,150 @@ class PRC_Sitemap {
 	}
 
 	/**
-	 * Update the sitemap with changes from recently modified posts
+	 * Update the sitemap with changes from recently modified posts.
+	 *
+	 * The pass reads the window [cursor, end) in one scan, queues the date of
+	 * every post it read, and only then moves the cursor to the end. A post
+	 * saved while the pass runs has a stamp at or after the end, so the next
+	 * pass reads it. A scan that fails moves nothing: it returns no rows, and
+	 * an empty window would hide the changes the pass never read.
+	 *
+	 * An admin who asks for the latest articles sets $through_lag. That pass
+	 * reads up to now, because the editor's save is already committed. It still
+	 * stores the lagged end as the cursor, so a row that was not committed yet
+	 * is read by the next cron pass. A date that two passes queue is one event.
+	 *
+	 * @param bool $through_lag Read the posts inside the lag too.
+	 * @return int The number of dates queued.
 	 */
-	public static function update_sitemap_from_modified_posts() {
-		$time                = time();
-		$last_modified_posts = self::get_last_modified_posts();
-		$dates               = self::get_post_dates( $last_modified_posts );
+	public static function update_sitemap_from_modified_posts( $through_lag = false ) {
+		global $wpdb;
 
+		$start    = self::get_update_cursor();
+		$end      = self::get_update_window_end( $start );
+		$read_end = $end;
+		if ( $through_lag ) {
+			$read_end = gmdate( 'Y-m-d H:i:s', min( time() + 1, strtotime( $start . ' UTC' ) + self::UPDATE_WINDOW_MAX ) );
+		}
+		if ( $read_end <= $start ) {
+			return 0;
+		}
+
+		$modified = self::get_last_modified_posts( $start, $read_end );
+		if ( ! empty( $wpdb->last_error ) ) {
+			// A failed query returns no rows, like an empty window. Leave the cursor so the next pass reads it.
+			return 0;
+		}
+
+		$queued = self::queue_date_updates( self::get_post_dates( $modified ), time() );
+
+		if ( $end > $start ) {
+			update_option( 'prc_sitemap_update_cursor', $end, false );
+		}
+		update_option( 'prc_sitemap_update_last_run', time(), false );
+
+		return $queued;
+	}
+
+	/**
+	 * Queue a rebuild of each date, one generation interval apart.
+	 *
+	 * @param string[] $dates Dates as Y-m-d.
+	 * @param int      $time  The time of the event before the first one.
+	 * @return int The number of dates queued.
+	 */
+	public static function queue_date_updates( $dates, $time ) {
+		$today  = wp_date( 'Y-m-d' );
+		$queued = 0;
 		foreach ( $dates as $date ) {
 			list( $year, $month, $day ) = explode( '-', $date );
 
-			// Do not allow non-existant or future dates to be queued.
-			if ( false === checkdate( $month, $day, $year ) || $time <= mktime( 0, 0, 0, $month, $day, $year ) ) {
+			// Do not allow non-existant or future dates to be queued. A post date is in the site's time zone, so today is too.
+			if ( false === checkdate( (int) $month, (int) $day, (int) $year ) || $date > $today ) {
 				continue;
 			}
 
 			$time += PRC_INTERVAL_PER_GENERATION_EVENT;
 
 			do_action( 'prc_update_sitemap_for_year_month_date', array( $year, $month, $day ), $time );
+			++$queued;
 		}
-		update_option( 'prc_sitemap_update_last_run', time(), false );
+		return $queued;
+	}
+
+	/**
+	 * Rebuild the old and the new date when a post date changes.
+	 *
+	 * The update pass sees only the new post_date, so the old date's sitemap
+	 * would keep the URL. This runs for any status: a post unpublished and
+	 * then moved as a draft before the next pass is still listed on its old
+	 * date.
+	 *
+	 * @param int     $post_id     The post ID.
+	 * @param WP_Post $post_after  The post after the update.
+	 * @param WP_Post $post_before The post before the update.
+	 */
+	public static function queue_dates_on_post_date_change( $post_id, $post_after, $post_before ) {
+		if ( ! in_array( $post_after->post_type, self::get_supported_post_types(), true ) ) {
+			return;
+		}
+
+		$dates = self::get_post_dates( array( $post_before, $post_after ) );
+		if ( count( $dates ) > 1 ) {
+			self::queue_date_updates( $dates, time() );
+		}
+	}
+
+	/**
+	 * Rebuild the date of a post when it goes live.
+	 *
+	 * Any move into publish: a scheduled post that cron publishes with
+	 * wp_publish_post(), which changes only post_status, and a post inserted
+	 * with a past post_date (the REST `date` field, `wp post create
+	 * --post_date`, importers), which core stamps with post_modified_gmt =
+	 * post_date. Both stamps are older than the window, so the update pass
+	 * does not select the post.
+	 *
+	 * @param string  $new_status New post status.
+	 * @param string  $old_status Old post status.
+	 * @param WP_Post $post       Post object.
+	 */
+	public static function queue_date_on_publish( $new_status, $old_status, $post ) {
+		if ( 'publish' !== $new_status || 'publish' === $old_status ) {
+			return;
+		}
+		if ( in_array( $post->post_type, self::get_supported_post_types(), true ) ) {
+			self::queue_date_updates( self::get_post_dates( array( $post ) ), time() );
+		}
+	}
+
+	/**
+	 * Rebuild the date of a published post that is deleted for good.
+	 *
+	 * A hard delete leaves no row for the update pass to read, so the date's
+	 * sitemap would keep the URL. A post that was published and then trashed
+	 * counts too: core keeps its earlier status in _wp_trash_meta_status. The
+	 * event runs one generation interval later, after the row is gone, and the
+	 * rebuild takes the lease of the date.
+	 *
+	 * @param int          $post_id The post ID.
+	 * @param WP_Post|null $post    The post. Core passes it since 5.5.
+	 */
+	public static function queue_date_on_hard_delete( $post_id, $post = null ) {
+		$post = $post ?? get_post( $post_id );
+		if ( ! $post || ! in_array( $post->post_type, self::get_supported_post_types(), true ) ) {
+			return;
+		}
+
+		$was_published = 'publish' === $post->post_status;
+		if ( 'trash' === $post->post_status ) {
+			$was_published = 'publish' === get_post_meta( $post->ID, '_wp_trash_meta_status', true );
+		}
+		if ( ! $was_published ) {
+			return;
+		}
+
+		self::queue_date_updates( self::get_post_dates( array( $post ) ), time() );
 	}
 
 	/**
@@ -975,7 +1351,7 @@ class PRC_Sitemap {
 	 * @param int|boolean $year The year to build the sitemap for.
 	 */
 	public static function build_root_sitemap_xml( $year = false ) {
-		$cache_key  = 'prc_sitemap_root_xml_' . md5( serialize( array( 'year' => $year ) ) );
+		$cache_key  = PRC_Sitemap_Cache::versioned_key( 'prc_sitemap_root_xml_' . md5( serialize( array( 'year' => $year ) ) ) );
 		$cached_xml = get_transient( $cache_key );
 
 		if ( false !== $cached_xml ) {
@@ -1021,7 +1397,6 @@ class PRC_Sitemap {
 
 		$result = $xml->asXML();
 
-		// Cache for 12 hours (standard duration for sitemap data)
 		set_transient( $cache_key, $result, PRC_Sitemap_Cache::CACHE_TIMES['standard'] );
 
 		return $result;
@@ -1039,17 +1414,17 @@ class PRC_Sitemap {
 		if ( self::$index_by_year ) {
 			$sitemap_url = add_query_arg(
 				array(
-					'mm' => date( 'm', $sitemap_time ),
-					'dd' => date( 'd', $sitemap_time ),
+					'mm' => gmdate( 'm', $sitemap_time ),
+					'dd' => gmdate( 'd', $sitemap_time ),
 				),
-				home_url( '/sitemap-' . date( 'Y', $sitemap_time ) . '.xml' )
+				home_url( '/sitemap-' . gmdate( 'Y', $sitemap_time ) . '.xml' )
 			);
 		} else {
 			$sitemap_url = add_query_arg(
 				array(
-					'yyyy' => date( 'Y', $sitemap_time ),
-					'mm'   => date( 'm', $sitemap_time ),
-					'dd'   => date( 'd', $sitemap_time ),
+					'yyyy' => gmdate( 'Y', $sitemap_time ),
+					'mm'   => gmdate( 'm', $sitemap_time ),
+					'dd'   => gmdate( 'd', $sitemap_time ),
 				),
 				home_url( '/sitemap-posts.xml' )
 			);
@@ -1157,8 +1532,8 @@ class PRC_Sitemap {
 	 * @return array
 	 */
 	public static function get_supported_post_types() {
-		$post_types         = get_post_types( array( 'public' => true ), 'names' );
-		$supported_types    = array_values(
+		$post_types      = get_post_types( array( 'public' => true ), 'names' );
+		$supported_types = array_values(
 			array_filter(
 				$post_types,
 				function ( $pt ) {
@@ -1247,7 +1622,7 @@ class PRC_Sitemap {
 			array(
 				'post_parent'    => $post_id,
 				'post_type'      => 'attachment',
-				'numberposts'    => -1,
+				'numberposts'    => -1, // phpcs:ignore WordPressVIPMinimum.Performance.NoPaging.posts_per_page_numberposts -- one post's own image attachments.
 				'post_status'    => 'inherit',
 				'post_mime_type' => 'image',
 			)
@@ -1293,7 +1668,7 @@ class PRC_Sitemap {
 		global $wpdb;
 
 		// Check cache first.
-		$cache_key   = "tax_lastmod_max_{$taxonomy}";
+		$cache_key   = PRC_Sitemap_Cache::versioned_key( "tax_lastmod_max_{$taxonomy}" );
 		$cached_time = wp_cache_get( $cache_key, self::CACHE_GROUP );
 
 		if ( false !== $cached_time ) {
@@ -1323,7 +1698,7 @@ class PRC_Sitemap {
 			INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
 			WHERE tt.taxonomy = %s
 			AND p.post_status = 'publish'
-			AND p.post_type IN ( " . self::get_supported_post_types_in() . ' )',
+			AND p.post_type IN ( " . self::get_supported_post_types_in() . ' )', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- get_supported_post_types_in() joins $wpdb->prepare( '%s' ) values.
 				$taxonomy
 			)
 		);
@@ -1341,14 +1716,17 @@ class PRC_Sitemap {
 			$last_modified = $post_modified;
 		}
 
-		// Cache for 24 hours (long duration for static data that rarely changes)
 		wp_cache_set( $cache_key, $last_modified, self::CACHE_GROUP, PRC_Sitemap_Cache::CACHE_TIMES['long'] );
 
 		return $last_modified;
 	}
 
 	/**
-	 * Invalidate relevant caches when posts are changed.
+	 * Start a new cache version when a published post is saved or deleted.
+	 *
+	 * A draft is not in any sitemap, so saving one changes nothing the caches
+	 * hold. A post that leaves or enters publish reaches
+	 * invalidate_caches_on_post_status_change().
 	 *
 	 * @param int     $post_id The post ID.
 	 * @param WP_Post $post The post object (optional).
@@ -1358,75 +1736,66 @@ class PRC_Sitemap {
 			$post = get_post( $post_id );
 		}
 
-		if ( ! $post || ! in_array( $post->post_type, self::get_supported_post_types(), true ) ) {
+		if ( ! $post || 'publish' !== $post->post_status || ! in_array( $post->post_type, self::get_supported_post_types(), true ) ) {
 			return;
 		}
 
-		// Invalidate date-based caches using utility class
-		$post_date = get_the_date( 'Y-m-d', $post );
-		if ( $post_date ) {
-			PRC_Sitemap_Cache::invalidate_date_caches( $post_date );
-		}
-
-		// Invalidate general caches
-		delete_transient( 'prc_sitemap_post_year_range' );
-		delete_transient( 'prc_sitemap_years_with_posts' );
-		delete_transient( 'prc_sitemap_count' );
-		PRC_Sitemap_Cache::delete_transients_by_pattern( 'prc_sitemap_recent_url_counts_%' );
-		PRC_Sitemap_Cache::delete_transients_by_pattern( 'prc_sitemap_root_xml_%' );
-		PRC_Sitemap_Cache::delete_transients_by_pattern( 'prc_sitemap_news_xml_%' );
-
-		// Clear object cache
-		wp_cache_delete( 'sitemap_stats', self::CACHE_GROUP );
+		PRC_Sitemap_Cache::bump_once_per_request();
 	}
 
 	/**
-	 * Invalidate caches when post status changes.
+	 * Start a new cache version when a post enters or leaves publish.
 	 *
 	 * @param string  $new_status New post status.
 	 * @param string  $old_status Old post status.
 	 * @param WP_Post $post Post object.
 	 */
 	public static function invalidate_caches_on_post_status_change( $new_status, $old_status, $post ) {
-		// Only invalidate if transitioning to/from publish status
-		if ( 'publish' === $new_status || 'publish' === $old_status ) {
-			self::invalidate_caches_on_post_change( $post->ID, $post );
+		if ( 'publish' !== $new_status && 'publish' !== $old_status ) {
+			return;
 		}
+
+		if ( ! in_array( $post->post_type, self::get_supported_post_types(), true ) ) {
+			return;
+		}
+
+		PRC_Sitemap_Cache::bump_once_per_request();
 	}
 
 	/**
-	 * Invalidate caches when taxonomy terms are created, edited, or deleted.
+	 * Start a new cache version when a term of a sitemap taxonomy is created, edited, or deleted.
 	 *
-	 * @param int      $term_id      Term ID.
-	 * @param int      $tt_id        Term taxonomy ID.
-	 * @param string   $taxonomy     Taxonomy slug.
-	 * @param WP_Term  $deleted_term Deleted term object (only on delete_term).
+	 * @param int     $term_id      Term ID.
+	 * @param int     $tt_id        Term taxonomy ID.
+	 * @param string  $taxonomy     Taxonomy slug.
+	 * @param WP_Term $deleted_term Deleted term object (only on delete_term).
 	 */
 	public static function invalidate_caches_on_term_change( $term_id, $tt_id, $taxonomy, $deleted_term = null ) {
 		$supported = apply_filters( 'prc_sitemap_supported_taxonomies', array( 'category' ) );
 		if ( ! in_array( $taxonomy, $supported, true ) ) {
 			return;
 		}
-		PRC_Sitemap_Cache::invalidate_taxonomy_caches( $taxonomy );
+		PRC_Sitemap_Cache::bump_once_per_request();
 	}
 
 	/**
-	 * Clear all sitemap caches.
+	 * Remove every queued sitemap cron event: the 15-minute update pass and the full build's walk.
+	 */
+	public static function unschedule_cron_hooks() {
+		foreach ( self::CRON_HOOKS as $hook ) {
+			wp_unschedule_hook( $hook );
+		}
+	}
+
+	/**
+	 * Retire every cached sitemap entry.
 	 *
-	 * @return void
+	 * @return array{previous: string, current: string} The cache version before and after.
 	 */
 	public static function clear_all_caches() {
 		return PRC_Sitemap_Cache::invalidate_all_caches();
 	}
-
-	/**
-	 * Scheduled cache cleanup function.
-	 *
-	 * @return void
-	 */
-	public static function scheduled_cache_cleanup() {
-		PRC_Sitemap_Cache::cleanup_expired_transients();
-	}
 }
 
 add_action( 'after_setup_theme', array( 'PRC_Sitemap', 'setup' ) );
+register_deactivation_hook( __FILE__, array( 'PRC_Sitemap', 'unschedule_cron_hooks' ) );

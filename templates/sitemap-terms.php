@@ -32,7 +32,7 @@ if ( empty( $requested_taxonomy ) ) {
 	);
 }
 
-$cache_key = "prc_sitemap_terms_xml_{$requested_taxonomy}_{$current_page}";
+$cache_key = PRC_Sitemap_Cache::versioned_key( "prc_sitemap_terms_xml_{$requested_taxonomy}_{$current_page}" );
 $xml       = PRC_Sitemap_Cache::get_cached_data(
 	$cache_key,
 	function () use ( $requested_taxonomy, $current_page ) {

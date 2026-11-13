@@ -21,7 +21,7 @@ if ( ! class_exists( 'WP_Sitemaps_Taxonomies' ) ) {
 	);
 }
 
-$cache_key = 'prc_sitemap_taxonomy_index_xml';
+$cache_key = PRC_Sitemap_Cache::versioned_key( 'prc_sitemap_taxonomy_index_xml' );
 $xml       = PRC_Sitemap_Cache::get_cached_data(
 	$cache_key,
 	function () {
@@ -33,7 +33,7 @@ $xml       = PRC_Sitemap_Cache::get_cached_data(
 		echo '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . PHP_EOL;
 
 		foreach ( $supported_taxonomies as $taxonomy ) {
-			$term_count_key = "prc_sitemap_term_count_{$taxonomy}";
+			$term_count_key = PRC_Sitemap_Cache::versioned_key( "prc_sitemap_term_count_{$taxonomy}" );
 			$term_count     = PRC_Sitemap_Cache::get_cached_data(
 				$term_count_key,
 				function () use ( $taxonomy ) {

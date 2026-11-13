@@ -65,131 +65,91 @@ class PRC_Sitemap_Cache {
 	}
 
 	/**
-	 * Batch delete transients by SQL LIKE pattern.
+	 * Whether a version bump waits for the end of the request.
 	 *
-	 * The caller is responsible for passing a valid SQL LIKE pattern where `%`
-	 * and `_` act as wildcards. Literal `%` or `_` characters in the non-wildcard
-	 * portion of the prefix must be pre-escaped by the caller with `$wpdb->esc_like()`.
-	 * All existing call sites use a trailing `%` wildcard only (e.g.
-	 * `'prc_sitemap_post_ids_2026-03-11_%'`), which is the expected usage.
-	 *
-	 * @param string $pattern SQL LIKE pattern for transient names (wildcards preserved).
-	 * @return int Number of option rows deleted (each transient = 2 rows: value + timeout).
+	 * @var bool
 	 */
-	public static function delete_transients_by_pattern( $pattern ) {
-		global $wpdb;
+	private static $bump_queued = false;
 
-		// Delete transients and their timeout options.
-		$deleted = $wpdb->query(
-			$wpdb->prepare(
-				"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
-				"_transient_{$pattern}",
-				"_transient_timeout_{$pattern}"
-			)
-		);
-
-		return $deleted;
+	/**
+	 * The current sitemap data version.
+	 *
+	 * @return string
+	 */
+	public static function version() {
+		return md5( wp_cache_get_last_changed( self::CACHE_GROUP ) );
 	}
 
 	/**
-	 * Invalidate date-specific caches.
+	 * Name a cache entry after the current sitemap data version.
 	 *
-	 * @param string $date Date in Y-m-d format.
-	 * @return void
+	 * A persistent object cache cannot delete transients by pattern, so a
+	 * change calls bump() and every key named before it stops matching.
+	 * Name the key before reading the data it holds, so data read before a
+	 * bump never lands under the version that follows it.
+	 *
+	 * @param string $key Cache key without the version.
+	 * @return string
 	 */
-	public static function invalidate_date_caches( $date ) {
-		list( $year, $month, $day ) = explode( '-', $date );
-
-		delete_transient( "prc_sitemap_date_has_posts_{$date}" );
-		delete_transient( "prc_sitemap_post_ids_{$date}" );
-		delete_transient( "prc_sitemap_year_has_posts_{$year}" );
-
-		// Clear any post IDs cache with different limits.
-		self::delete_transients_by_pattern( "prc_sitemap_post_ids_{$date}_%" );
+	public static function versioned_key( $key ) {
+		return $key . '_' . self::version();
 	}
 
 	/**
-	 * Invalidate year-specific caches.
+	 * Start a new sitemap data version.
 	 *
-	 * @param int $year The year.
 	 * @return void
 	 */
-	public static function invalidate_year_caches( $year ) {
-		delete_transient( "prc_sitemap_year_has_posts_{$year}" );
-		self::delete_transients_by_pattern( "prc_sitemap_date_has_posts_{$year}-%" );
-		self::delete_transients_by_pattern( "prc_sitemap_post_ids_{$year}-%" );
+	public static function bump() {
+		wp_cache_set_last_changed( self::CACHE_GROUP );
 	}
 
 	/**
-	 * Invalidate taxonomy-specific caches.
+	 * Start a new sitemap data version once, after the request has written everything it changes.
 	 *
-	 * @param string $taxonomy The taxonomy slug.
+	 * A save runs several hooks, and a bulk edit saves many posts. Each one
+	 * asks for a bump, and the version changes at shutdown, so a reader never
+	 * caches old data under the new version between two writes.
+	 *
 	 * @return void
 	 */
-	public static function invalidate_taxonomy_caches( $taxonomy ) {
-		delete_transient( "prc_sitemap_term_count_{$taxonomy}" );
-		wp_cache_delete( "tax_lastmod_max_{$taxonomy}", self::CACHE_GROUP );
-
-		// Clear cached taxonomy template output.
-		delete_transient( 'prc_sitemap_taxonomy_index_xml' );
-		self::delete_transients_by_pattern( "prc_sitemap_terms_xml_{$taxonomy}_%" );
+	public static function bump_once_per_request() {
+		if ( self::$bump_queued ) {
+			return;
+		}
+		self::$bump_queued = true;
+		add_action( 'shutdown', array( __CLASS__, 'run_queued_bump' ) );
 	}
 
 	/**
-	 * Invalidate all sitemap caches.
+	 * Run the bump that bump_once_per_request() queued.
 	 *
 	 * @return void
+	 */
+	public static function run_queued_bump() {
+		if ( ! self::$bump_queued ) {
+			return;
+		}
+		self::$bump_queued = false;
+		self::bump();
+	}
+
+	/**
+	 * Retire every cached sitemap entry.
+	 *
+	 * Every cache family names its keys with the version, so one bump retires
+	 * them all. The entries stay in the cache until they expire (24 hours),
+	 * and nothing reads them.
+	 *
+	 * @return array{previous: string, current: string} The version before and after.
 	 */
 	public static function invalidate_all_caches() {
-		global $wpdb;
-
-		// Delete all sitemap transients.
-		$deleted = $wpdb->query(
-			"DELETE FROM {$wpdb->options}
-			 WHERE option_name LIKE '_transient_prc_sitemap_%'
-			    OR option_name LIKE '_transient_timeout_prc_sitemap_%'
-			    OR option_name LIKE '_transient_sitemap_ajax_stats_%'
-			    OR option_name LIKE '_transient_timeout_sitemap_ajax_stats_%'"
-		);
-
-		// Clear object cache group
-		wp_cache_flush_group( self::CACHE_GROUP );
-
-		// Clear taxonomy caches
-		wp_cache_delete_multiple(
-			array(
-				'sitemap_stats',
-				'tax_lastmod_max_category',
-				'tax_lastmod_max_post_tag',
-			),
-			self::CACHE_GROUP
-		);
-
-		return $deleted;
-	}
-
-	/**
-	 * Get cache statistics.
-	 *
-	 * @return array Cache statistics.
-	 */
-	public static function get_cache_stats() {
-		global $wpdb;
-
-		$transient_count = $wpdb->get_var(
-			"SELECT COUNT(*) FROM {$wpdb->options}
-			 WHERE option_name LIKE '_transient_prc_sitemap_%'"
-		);
-
-		$timeout_count = $wpdb->get_var(
-			"SELECT COUNT(*) FROM {$wpdb->options}
-			 WHERE option_name LIKE '_transient_timeout_prc_sitemap_%'"
-		);
+		$previous = self::version();
+		self::bump();
 
 		return array(
-			'transients' => intval( $transient_count ),
-			'timeouts'   => intval( $timeout_count ),
-			'total'      => intval( $transient_count ) + intval( $timeout_count ),
+			'previous' => $previous,
+			'current'  => self::version(),
 		);
 	}
 
@@ -199,50 +159,17 @@ class PRC_Sitemap_Cache {
 	 * @return void
 	 */
 	public static function preload_caches() {
-		// Preload year range
+		// Preload year range.
 		PRC_Sitemap::get_post_year_range();
 
-		// Preload years with posts
+		// Preload years with posts.
 		PRC_Sitemap::check_year_has_posts();
 
-		// Preload sitemap count
+		// Preload sitemap count.
 		PRC_Sitemap::count_sitemaps();
 
-		// Preload recent URL counts
+		// Preload recent URL counts.
 		PRC_Sitemap::get_recent_sitemap_url_counts( 7 );
-	}
-
-	/**
-	 * Clean up expired transients.
-	 *
-	 * @return int Number of expired transients cleaned up.
-	 */
-	public static function cleanup_expired_transients() {
-		global $wpdb;
-
-		$current_time = time();
-
-		// Find expired timeout options
-		$expired_timeouts = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT option_name FROM {$wpdb->options}
-				 WHERE option_name LIKE '_transient_timeout_prc_sitemap_%'
-				   AND option_value < %d",
-				$current_time
-			)
-		);
-
-		$deleted = 0;
-		foreach ( $expired_timeouts as $timeout_option ) {
-			$transient_option = str_replace( '_transient_timeout_', '_transient_', $timeout_option );
-
-			// Delete both the transient and its timeout
-			delete_option( $timeout_option );
-			delete_option( $transient_option );
-			$deleted += 2;
-		}
-
-		return $deleted;
 	}
 
 	/**
@@ -257,16 +184,16 @@ class PRC_Sitemap_Cache {
 		$end   = strtotime( $end_date );
 
 		for ( $current = $start; $current <= $end; $current = strtotime( '+1 day', $current ) ) {
-			$date = date( 'Y-m-d', $current );
+			$date = gmdate( 'Y-m-d', $current );
 
-			// Pre-cache date checks
+			// Pre-cache date checks.
 			PRC_Sitemap::date_range_has_posts( $date, $date );
 
-			// Pre-cache post IDs if date has posts
+			// Pre-cache post IDs if date has posts.
 			$post_ids = PRC_Sitemap::get_post_ids_for_date( $date );
 
 			if ( ! empty( $post_ids ) ) {
-				// Cache different limits too
+				// Cache different limits too.
 				PRC_Sitemap::get_post_ids_for_date( $date, 100 );
 				PRC_Sitemap::get_post_ids_for_date( $date, 1000 );
 			}
